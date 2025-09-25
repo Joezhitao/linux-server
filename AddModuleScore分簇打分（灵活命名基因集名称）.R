@@ -12,8 +12,8 @@ rm(list = ls())
 # 设置基因集参数
 geneset_file <- "gene1.xlsx"  # 基因集文件名
 geneset_sheet <- 1            # Excel中的sheet索引
-geneset_name <- "Regeneration" # 基因集名称 (例如: "Senescence", "Regeneration", etc.)
-output_prefix <- "Regeneration_geneset" # 输出文件前缀
+geneset_name <- "Proliferation" # 基因集名称 (例如: "Senescence", "Regeneration", etc.)
+output_prefix <- "Proliferation_geneset" # 输出文件前缀
 # ====================================
 
 # 读取已处理的Seurat对象
