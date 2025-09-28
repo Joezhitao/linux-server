@@ -11,7 +11,7 @@ rm(list = ls())
 
 # ============ 参数设置区域 ============
 # 设置分组变量
-group_by <- "seurat_clusters"  # 可以是 "group" 或 "seurat_clusters" 或其他元数据列
+group_by <- "group"  # 可以是 "group" 或 "seurat_clusters" 或其他元数据列
 
 # 设置输出路径
 output_dir <- "./"
@@ -247,12 +247,12 @@ if (nrow(heatmap_data) > 0) {
   heatmap_matrix_scaled[is.nan(heatmap_matrix_scaled)] <- 0
   
   # 为不同类别设置颜色
-  category_colors <- list(category = c("Damage & Stress Response" = "#E41A1C", 
+  category_colors <- list(category = c("Damage & Stress Response" = "#EE9A00", 
                                        "Cell State & Fate" = "#377EB8", 
                                        "Metabolic Reprogramming" = "#4DAF4A"))
   
   # 设置热图颜色 - 使用blue-white-red配色方案
-  color_palette <- colorRampPalette(c("blue", "white", "red"))(100)
+  color_palette <- colorRampPalette(c("#6495ED", "white", "#548B54"))(100)
   
   # 生成热图
   heatmap_path <- paste0(output_dir, "Pathway_Activity_Heatmap_by_", group_by, ".png")
@@ -284,7 +284,7 @@ if (nrow(heatmap_data) > 0) {
     
     pheatmap(
       heatmap_matrix,
-      color = colorRampPalette(c("blue", "white", "red"))(100),  # 使用blue-white-red配色
+      color = colorRampPalette(c("#6495ED", "white", "#548B54"))(100),  # 使用blue-white-red配色
       cluster_rows = FALSE,
       cluster_cols = FALSE,
       fontsize_row = 12,
@@ -330,7 +330,7 @@ if (nrow(heatmap_data) > 0) {
         
         pheatmap(
           category_matrix_scaled,
-          color = colorRampPalette(c("blue", "white", "red"))(100),  # 使用blue-white-red配色
+          color = colorRampPalette(c("#6495ED", "white", "#548B54"))(100),  # 使用blue-white-red配色
           cluster_rows = TRUE,
           cluster_cols = FALSE,
           fontsize_row = 12,

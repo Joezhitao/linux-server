@@ -51,7 +51,7 @@ p <- ggviolin(pbmc@meta.data,
               y = score_column,
               color = "seurat_clusters", 
               fill = "seurat_clusters",
-              add = "mean_sd", 
+              add = "mean_sd", #mean
               add.params = list(color = "black")) +
   stat_compare_means(comparisons = list(c("S1", "S2")), 
                      label = "p.signif") +
@@ -77,7 +77,7 @@ cat(paste0("UMAP图已保存为: ", umap_filename, "\n"))
 
 # 创建小提琴图比较不同簇之间的评分 - 去掉对比线和p值
 p <- ggviolin(pbmc@meta.data, 
-              x = "seurat_clusters", 
+              x = "seurat_clusters", #选择分簇进行分析
               y = score_column,
               color = "seurat_clusters", 
               fill = "seurat_clusters",

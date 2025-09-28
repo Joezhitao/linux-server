@@ -1,0 +1,872 @@
+---
+title: "scRNA_pre"
+author: "Joe"
+date: "2025-09-28"
+output: html_document
+---
+
+R Markdown文档的初始设置部分，主要用于配置数据分析环境、设置中文字体支持以及加载必要的R包
+```{r setup, include=FALSE}
+# 设置R代码块的显示选项，使所有代码块默认可见
+knitr::opts_chunk$set(echo = TRUE)
+
+# 设置工作目录为"/home/lin/gfp"，这样后续所有文件操作都基于此路径
+knitr::opts_knit$set(root.dir = "/home/lin/gfp")
+
+# 根据不同操作系统配置中文字体支持
+# 中文字体在数据可视化时非常重要，确保图表中的中文标签正确显示
+if(Sys.info()["sysname"] == "Darwin") {  # macOS系统的字体配置
+  library(showtext)  # 加载showtext包用于处理字体
+  showtext_auto()    # 自动启用showtext功能
+  
+  # 尝试按优先级添加macOS常见的中文字体，如果前一个不存在则尝试下一个
+  tryCatch({
+    font_add("chinese", "/System/Library/Fonts/PingFang.ttc")
+  }, error = function(e) {
+    tryCatch({
+      font_add("chinese", "/System/Library/Fonts/STHeiti Light.ttc")
+    }, error = function(e) {
+      font_add("chinese", "/System/Library/Fonts/Arial Unicode MS.ttf")
+    })
+  })
+  
+  # 设置ggplot2的默认主题并指定使用中文字体
+  theme_set(theme_minimal(base_family = "chinese"))
+  par(family = "chinese")  # 设置基础绘图函数的字体
+} else if(Sys.info()["sysname"] == "Linux") {  # Linux系统的字体配置
+  library(showtext)
+  showtext_auto()
+  
+  # 尝试添加Linux常见的中文字体
+  tryCatch({
+    font_add("chinese", "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc")
+  }, error = function(e) {
+    tryCatch({
+      font_add("chinese", "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf")
+    }, error = function(e) {
+      message("未找到中文字体，可能影响中文显示效果")
+    })
+  })
+  
+  theme_set(theme_minimal(base_family = "chinese"))
+  par(family = "chinese")
+}
+
+# 加载单细胞RNA-seq分析所需的R包
+# suppressPackageStartupMessages()函数用于抑制加载包时的消息输出，保持控制台整洁
+suppressPackageStartupMessages({
+  library(Seurat)       # 单细胞RNA-seq分析的核心包
+  library(harmony)      # 用于批次效应校正
+  library(tidyverse)    # 数据处理和可视化工具集
+  library(dplyr)        # 数据操作和转换
+  library(patchwork)    # 组合多个ggplot图形
+  library(ggplot2)      # 数据可视化
+  library(cowplot)      # 排列ggplot图形
+  library(DoubletFinder) # 检测单细胞数据中的双胞体
+  library(DropletUtils) # 用于液滴测序数据的处理，包括空液滴检测
+  library(scater)       # 单细胞数据质控和可视化
+  library(scran)        # 单细胞RNA数据归一化和分析
+})
+
+# 清理R环境中的所有变量，确保分析从干净的环境开始
+rm(list = ls())
+```
+
+## 1. 批量读取数据并进行空液滴检测
+
+单细胞RNA测序数据的批量预处理流程，主要通过自动化读取多个10XGenomics格式样本并执行空液滴检测。我们优先采用emptyDrops统计方法识别真实细胞，同时实现了自适应策略以应对不同数据特征，当主要方法不适用时会自动切换到基于UMI阈值的备选方案。整个流程确保了细胞识别的准确性和处理的稳健性，同时详细记录了每个样本的处理统计数据，为后续的质控、归一化和细胞类型注释等分析奠定基础。这种方法相比简单的固定阈值策略，能更有效地保留稀有细胞类型并提高数据质量
+
+```{r empty drop}
+# 获取目录列表 - 查找所有样本文件夹
+dir_name <- list.files('/home/lin/gfp_scRNA/')
+print("发现的样本目录:")
+print(dir_name)
+
+# 初始化两个重要数据结构：
+# 1. scRNAlist - 用于存储所有样本的Seurat对象
+# 2. loading_stats - 用于记录每个样本的处理统计信息
+scRNAlist <- list()
+loading_stats <- data.frame(
+  Sample = character(),        # 样本名称
+  Raw_Droplets = numeric(),    # 原始液滴数量
+  Called_Cells = numeric(),    # 鉴定为细胞的液滴数量
+  Cell_Rate = numeric(),       # 细胞率(%)
+  Method_Used = character(),   # 使用的细胞鉴定方法
+  stringsAsFactors = FALSE
+)
+
+print("开始批量读取数据并进行空液滴检测...")
+
+# 循环处理每个样本目录
+for(i in 1:length(dir_name)){
+  cat(paste0("处理样本 ", i, ": ", dir_name[i], "\n"))
+  
+  # 读取10X Genomics格式的原始计数矩阵
+  counts <- Read10X(data.dir = file.path("/home/lin/gfp_scRNA/", dir_name[i]))
+  raw_droplets <- ncol(counts)  # 记录原始液滴数量
+  method_used <- "Direct"       # 默认方法标记
+  
+  cat(paste0("  原始液滴数: ", raw_droplets, "\n"))
+  
+  # 只对大样本(>1000个液滴)尝试空液滴检测
+  if(raw_droplets > 1000) {
+    cat("  尝试空液滴检测...\n")
+    
+    tryCatch({
+      # 计算每个液滴的总UMI计数
+      total_counts <- Matrix::colSums(counts)
+      
+      # 评估数据是否适合空液滴检测：需要足够的低计数和高计数液滴
+      low_count_droplets <- sum(total_counts <= 100 & total_counts > 0)
+      high_count_droplets <- sum(total_counts > 1000)
+      
+      cat(paste0("    低计数液滴 (≤100): ", low_count_droplets, "\n"))
+      cat(paste0("    高计数液滴 (>1000): ", high_count_droplets, "\n"))
+      
+      # 如果同时有足够的低计数和高计数液滴，使用emptyDrops算法
+      if(low_count_droplets >= 100 && high_count_droplets >= 100) {
+        # 运行emptyDrops算法，基于环境RNA背景分布识别真实细胞
+        e.out <- emptyDrops(counts, 
+                           lower = 100,      # 低于此UMI计数的液滴被视为环境RNA
+                           niters = 3000,    # 统计检验的迭代次数
+                           test.ambient = TRUE)  # 测试环境RNA分布
+        
+        # 选择显著的细胞(FDR <= 1%)
+        is_cell <- e.out$FDR <= 0.01 & !is.na(e.out$FDR)
+        
+        # 如果检测到足够的细胞(>50)，使用emptyDrops结果
+        if(sum(is_cell) > 50) {
+          counts <- counts[, is_cell]  # 只保留被识别为细胞的列
+          method_used <- "EmptyDrops"  # 记录使用的方法
+          cat(paste0("    空液滴检测成功，保留 ", sum(is_cell), " 个细胞\n"))
+        } else {
+          # 空液滴检测结果太少，使用简单UMI阈值法作为备用
+          cat("    空液滴检测结果过少，使用UMI阈值方法\n")
+          counts <- counts[, total_counts > 1000]
+          method_used <- "UMI_Threshold_1000"
+        }
+      } else {
+        # 数据分布不适合空液滴检测，使用UMI阈值法
+        cat("    数据不适合空液滴检测，使用UMI阈值方法\n")
+        counts <- counts[, total_counts > 1000]
+        method_used <- "UMI_Threshold_1000"
+      }
+    }, error = function(e) {
+      # 捕获并处理空液滴检测过程中的任何错误
+      cat(paste0("    空液滴检测失败: ", e$message, "\n"))
+      cat("    使用UMI阈值方法作为备用\n")
+      
+      total_counts <- Matrix::colSums(counts)
+      
+      # 根据数据分布动态选择合适的UMI阈值
+      threshold <- if(median(total_counts) > 2000) 1000 
+                   else if(median(total_counts) > 1000) 500 
+                   else 200
+      
+      # <<- 操作符用于在错误处理函数中修改外部变量
+      counts <<- counts[, total_counts > threshold]
+      method_used <<- paste0("UMI_Threshold_", threshold)
+    })
+  } else {
+    # 对于小样本(<1000个液滴)，直接使用UMI阈值法
+    cat("  样本较小，直接使用UMI阈值方法\n")
+    total_counts <- Matrix::colSums(counts)
+    
+    # 为小样本选择较低的阈值
+    threshold <- ifelse(median(total_counts) > 500, 500, 200)
+    counts <- counts[, total_counts > threshold]
+    method_used <- paste0("UMI_Threshold_", threshold, "_Small")
+  }
+  
+  # 记录最终鉴定的细胞数量和比例
+  called_cells_final <- ncol(counts)
+  cell_rate <- round((called_cells_final / raw_droplets) * 100, 2)
+  
+  # 最终安全检查：如果细胞数过少，尝试使用更低的阈值重新处理
+  if(called_cells_final < 50) {
+    cat("  警告：细胞数过少，尝试降低阈值\n")
+    # 重新读取数据并使用更低的阈值(100 UMIs)
+    counts <- Read10X(data.dir = file.path("/Users/joe/Desktop/gfp", dir_name[i]))
+    total_counts <- Matrix::colSums(counts)
+    counts <- counts[, total_counts > 100]
+    called_cells_final <- ncol(counts)
+    cell_rate <- round((called_cells_final / raw_droplets) * 100, 2)
+    method_used <- paste0(method_used, "_Lowered")
+  }
+  
+  # 创建Seurat对象，设置基本质控标准
+  if(called_cells_final > 0) {
+    scRNAlist[[i]] <- CreateSeuratObject(
+      counts, 
+      project = dir_name[i],
+      min.cells = 3,     # 只保留在至少3个细胞中表达的基因
+      min.features = 200 # 只保留表达至少200个基因的细胞
+    )
+    
+    cat(paste0("  成功创建Seurat对象\n"))
+  } else {
+    # 如果没有检测到有效细胞，记录警告并设为NULL
+    warning(paste0("样本 ", i, " 没有检测到有效细胞"))
+    scRNAlist[[i]] <- NULL
+  }
+  
+  # 将本样本的处理结果添加到统计表中
+  loading_stats <- rbind(loading_stats, data.frame(
+    Sample = dir_name[i],
+    Raw_Droplets = raw_droplets,
+    Called_Cells = called_cells_final,
+    Cell_Rate = cell_rate,
+    Method_Used = method_used
+  ))
+  
+  cat(paste0("  最终细胞数: ", called_cells_final, " (", cell_rate, "%) - ", method_used, "\n"))
+  cat(paste(rep("-", 40), collapse = ""), "\n")  # 打印分隔线
+}
+
+# 从列表中移除空(NULL)样本
+scRNAlist <- scRNAlist[!sapply(scRNAlist, is.null)]
+
+# 显示所有样本的数据加载统计
+print("数据加载统计:")
+print(loading_stats)
+
+# 显示不同细胞鉴定方法的使用频率
+print("\n使用方法统计:")
+print(table(loading_stats$Method_Used))
+```
+
+## 2. 设置物种特定参数
+
+本段代码建立了一个灵活的物种基因注释配置系统，用于适配不同物种的单细胞RNA测序数据分析。我们定义了包括人类、小鼠、大鼠和斑马鱼在内的多种模式生物的基因命名规则和重要基因集合，特别是线粒体基因、核糖体基因和血红蛋白基因的识别模式。这些配置对于后续的质控至关重要，因为不同物种的基因命名规则存在差异，正确识别这些特征基因是评估细胞质量、排除红细胞污染和线粒体含量异常细胞的基础
+
+```{r SPECIES}
+# 物种配置 - 设置当前分析的目标物种为小鼠
+SPECIES <- "mouse"
+
+# 物种基因注释配置 - 为不同物种定义基因识别模式和重要基因列表
+species_config <- list(
+  human = list(
+    mt_pattern = "^MT-",       # 人类线粒体基因前缀模式
+    ribo_pattern = "^RP[SL]",  # 人类核糖体基因前缀模式
+    hb_genes = c("HBA1", "HBA2", "HBB", "HBD", "HBE1", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ"), # 人类血红蛋白基因
+    species_name = "Human"     # 物种显示名称
+  ),
+  mouse = list(
+    mt_pattern = "^mt-",       # 小鼠线粒体基因前缀模式
+    ribo_pattern = "^Rp[sl]",  # 小鼠核糖体基因前缀模式
+    hb_genes = c("Hba-a1", "Hba-a2", "Hbb-bs", "Hbb-bt", "Hbb-bh1", "Hbb-bh2", "Hbb-y", "Hbe1"), # 小鼠血红蛋白基因
+    species_name = "Mouse"     # 物种显示名称
+  ),
+  rat = list(
+    mt_pattern = "^Mt",        # 大鼠线粒体基因前缀模式
+    ribo_pattern = "^Rp[sl]",  # 大鼠核糖体基因前缀模式
+    hb_genes = c("Hba1", "Hba2", "Hbb"), # 大鼠血红蛋白基因
+    species_name = "Rat"       # 物种显示名称
+  ),
+  zebrafish = list(
+    mt_pattern = "^mt",        # 斑马鱼线粒体基因前缀模式
+    ribo_pattern = "^rp[sl]",  # 斑马鱼核糖体基因前缀模式
+    hb_genes = c("hbaa1", "hbaa2", "hbae1", "hbae3", "hbba1", "hbba2", "hbbe1"), # 斑马鱼血红蛋白基因
+    species_name = "Zebrafish" # 物种显示名称
+  )
+)
+
+# 验证物种配置 - 确保选择的物种在配置中存在
+current_config <- species_config[[SPECIES]]
+if(is.null(current_config)) {
+  stop(paste0("不支持的物种: '", SPECIES, "'! 支持的物种: ", 
+              paste(names(species_config), collapse = ", ")))
+}
+
+# 显示当前配置 - 输出选定物种的配置信息
+cat("=== 当前物种配置 ===\n")
+cat("物种:", current_config$species_name, "\n")
+cat("线粒体基因模式:", current_config$mt_pattern, "\n")
+cat("核糖体基因模式:", current_config$ribo_pattern, "\n")
+cat("血红蛋白基因数量:", length(current_config$hb_genes), "\n")
+cat("血红蛋白基因:", paste(current_config$hb_genes[1:min(5, length(current_config$hb_genes))], collapse = ", "))
+if(length(current_config$hb_genes) > 5) cat("...") # 如果基因过多，只显示前5个
+cat("\n")
+cat("========================\n")
+```
+
+## 3. 计算质控指标
+
+本段代码实现了对单细胞RNA测序数据的全面质量控制指标计算，基于前面配置的物种特异性基因注释。我们为每个样本计算了一系列关键质控参数，包括线粒体基因表达比例（反映细胞活力）、血红蛋白基因表达（检测红细胞污染）、核糖体基因表达（反映蛋白质合成活性）以及基本的测序深度和基因覆盖度指标。这些指标对评估数据质量、识别潜在的技术偏差和生物污染至关重要，为后续的数据过滤和下游分析提供了依据。所有计算结果不仅在控制台输出，还保存为日期标记的CSV文件，便于数据记录和后续参考。
+
+```{r 质控}
+print("开始计算质控指标...")
+
+# 质控统计表 - 初始化用于存储所有样本质控指标的数据框
+qc_summary <- data.frame(
+  Sample = 1:length(scRNAlist),                                 # 样本编号
+  Sample_Name = sapply(scRNAlist, function(x) x@project.name),  # 样本名称
+  Cells = sapply(scRNAlist, ncol),                              # 细胞数量
+  MT_genes_found = NA,                                          # 发现的线粒体基因数
+  HB_genes_found = NA,                                          # 发现的血红蛋白基因数
+  Ribo_genes_found = NA,                                        # 发现的核糖体基因数
+  Mean_MT_percent = NA,                                         # 平均线粒体基因表达比例
+  Mean_HB_percent = NA,                                         # 平均血红蛋白基因表达比例
+  Mean_Ribo_percent = NA,                                       # 平均核糖体基因表达比例
+  Median_nUMI = NA,                                             # 中位数UMI计数
+  Median_nGene = NA,                                            # 中位数基因数
+  stringsAsFactors = FALSE
+)
+
+# 处理每个样本
+for(i in 1:length(scRNAlist)) {
+  cat(paste0("处理样本 ", i, "/", length(scRNAlist), " (", current_config$species_name, ")...\n"))
+  
+  seu <- scRNAlist[[i]]  # 获取当前样本的Seurat对象
+  
+  # 获取基因名称列表
+  all_genes <- rownames(seu)
+  
+  # 根据物种配置识别特定类型的基因
+  mt_genes <- grep(current_config$mt_pattern, all_genes, value = TRUE, ignore.case = TRUE)  # 线粒体基因
+  ribo_genes <- grep(current_config$ribo_pattern, all_genes, value = TRUE, ignore.case = TRUE)  # 核糖体基因
+  hb_genes_present <- intersect(current_config$hb_genes, all_genes)  # 血红蛋白基因
+  
+  # 如果直接匹配未找到血红蛋白基因，尝试不区分大小写匹配
+  if(length(hb_genes_present) == 0) {
+    hb_genes_present <- all_genes[toupper(all_genes) %in% toupper(current_config$hb_genes)]
+  }
+  
+  # 显示找到的基因数量
+  cat(paste0("  发现基因: MT(", length(mt_genes), "), HB(", length(hb_genes_present), 
+             "), Ribo(", length(ribo_genes), ")\n"))
+  
+  # 显示找到的基因示例（前几个）
+  if(length(mt_genes) > 0) {
+    cat(paste0("    MT基因示例: ", paste(head(mt_genes, 3), collapse = ", "), "\n"))
+  }
+  if(length(hb_genes_present) > 0) {
+    cat(paste0("    HB基因示例: ", paste(head(hb_genes_present, 3), collapse = ", "), "\n"))
+  }
+  
+  # 计算基本质控指标：每个细胞的UMI总数和基因数
+  seu$nUMI <- Matrix::colSums(GetAssayData(seu, slot = "counts"))
+  seu$nGene <- Matrix::colSums(GetAssayData(seu, slot = "counts") > 0)
+  
+  # 计算线粒体基因表达比例
+  if(length(mt_genes) > 0) {
+    seu <- PercentageFeatureSet(seu, pattern = current_config$mt_pattern, col.name = "mt_percent")
+  } else {
+    warning(paste0("样本 ", i, " 中未发现线粒体基因，请检查基因命名格式"))
+    seu$mt_percent <- 0
+  }
+  
+  # 计算血红蛋白基因表达比例
+  if(length(hb_genes_present) > 0) {
+    seu <- PercentageFeatureSet(seu, features = hb_genes_present, col.name = "HB_percent")
+  } else {
+    cat(paste0("    样本 ", i, " 中未发现血红蛋白基因（正常情况）\n"))
+    seu$HB_percent <- 0
+  }
+  
+  # 计算核糖体基因表达比例
+  if(length(ribo_genes) > 0) {
+    seu <- PercentageFeatureSet(seu, pattern = current_config$ribo_pattern, col.name = "ribo_percent")
+  } else {
+    warning(paste0("样本 ", i, " 中未发现核糖体基因，请检查基因命名格式"))
+    seu$ribo_percent <- 0
+  }
+  
+  # 计算衍生指标：基因复杂度和log10转换的计数值
+  seu$gene_complexity <- seu$nGene / seu$nUMI  # 基因复杂度（基因数/UMI数）
+  seu$log10_nUMI <- log10(seu$nUMI)            # log10转换的UMI计数
+  seu$log10_nGene <- log10(seu$nGene)          # log10转换的基因数
+  
+  # 更新Seurat对象到列表
+  scRNAlist[[i]] <- seu
+  
+  # 更新质控统计表
+  qc_summary[i, c("MT_genes_found", "HB_genes_found", "Ribo_genes_found",
+                  "Mean_MT_percent", "Mean_HB_percent", "Mean_Ribo_percent",
+                  "Median_nUMI", "Median_nGene")] <- 
+    c(length(mt_genes), length(hb_genes_present), length(ribo_genes),
+      round(mean(seu$mt_percent), 2), round(mean(seu$HB_percent), 2), 
+      round(mean(seu$ribo_percent), 2),
+      round(median(seu$nUMI), 0), round(median(seu$nGene), 0))
+  
+  # 输出关键质控指标摘要
+  cat(paste0("  质控指标 - MT:", round(mean(seu$mt_percent), 2), "%, ",
+             "HB:", round(mean(seu$HB_percent), 2), "%, ",
+             "Ribo:", round(mean(seu$ribo_percent), 2), "%\n"))
+  cat(paste0("  中位数 - UMI:", median(seu$nUMI), ", Gene:", median(seu$nGene), "\n"))
+  cat(paste(rep("-", 50), collapse = ""), "\n")
+}
+
+print("质控指标计算完成!")
+print("\n=== 质控统计汇总 ===")
+print(qc_summary)
+
+# 保存质控统计结果到CSV文件，文件名包含物种和日期信息
+write.csv(qc_summary, paste0("QC_summary_", SPECIES, "_", Sys.Date(), ".csv"), row.names = FALSE)
+cat(paste0("\n质控统计已保存至: QC_summary_", SPECIES, "_", Sys.Date(), ".csv\n"))
+```
+
+## 4. 质控前可视化
+
+本段代码实现了对单细胞RNA测序数据质控指标的可视化，通过小提琴图直观展示每个样本在质控前的关键特征分布。我们为每个样本绘制了包含基因数、UMI计数、线粒体基因比例、血红蛋白基因比例和核糖体基因比例的多面板小提琴图，这些图形有助于识别样本中的低质量细胞和潜在的技术偏差，为后续设定合理的质控阈值提供依据
+
+```{r}
+print("绘制质控前小提琴图...")
+
+# 初始化列表存储每个样本的小提琴图
+violin_before <- list()
+
+# 为每个样本创建质控小提琴图
+for(i in 1:length(scRNAlist)){
+  # 检查样本是否存在且有细胞 - 避免处理空样本
+  if(!is.null(scRNAlist[[i]]) && ncol(scRNAlist[[i]]) > 0) {
+    
+    # 获取样本名称用于图表标题
+    sample_name <- scRNAlist[[i]]@project.name
+    
+    # 创建多面板小提琴图，展示5个关键质控指标
+    violin_before[[i]] <- VlnPlot(scRNAlist[[i]],
+                                  features = c("nFeature_RNA", "nCount_RNA", 
+                                               "mt_percent", "HB_percent", "ribo_percent"), 
+                                  pt.size = 0.01,  # 设置点的大小较小以减少视觉干扰
+                                  ncol = 5) +      # 5个指标排成一行
+      plot_annotation(title = paste0("Sample ", i, " (", sample_name, ") - 质控前"),
+                      theme = theme(plot.title = element_text(hjust = 0.5, size = 14)))
+    
+    cat(paste0("完成样本 ", i, " 的质控图\n"))
+  } else {
+    # 跳过无效样本
+    cat(paste0("跳过样本 ", i, " (无有效数据)\n"))
+    violin_before[[i]] <- NULL
+  }
+}
+
+# 移除列表中的空元素（对应无效样本）
+violin_before <- violin_before[!sapply(violin_before, is.null)]
+
+# 显示所有样本的质控图
+print("=== 质控前小提琴图 ===")
+for(i in 1:length(violin_before)) {
+  print(violin_before[[i]])  # 在R Markdown中逐个显示图形
+}
+
+# 输出生成的图形数量
+print(paste0("共生成 ", length(violin_before), " 个样本的质控图"))
+
+```
+
+## 5. 质控过滤
+
+本段代码实现了对单细胞RNA测序数据的质量控制过滤，采用固定阈值策略移除低质量细胞和潜在的技术伪影。我们对每个样本应用了一套综合的过滤标准，包括基因数（200-8000）、UMI计数（500-50000）、线粒体基因比例（<20%）和血红蛋白基因比例（<10%）。这些阈值设计较为宽松，旨在保留大多数真实细胞同时去除明显的低质量细胞，如空液滴、细胞碎片、死细胞和红细胞污染。代码同时记录了每个样本过滤前后的细胞数量和保留率，为后续分析提供了质控效果的量化评估
+
+```{r filter}
+print("使用简单固定阈值过滤...")
+
+# 初始化数据框用于保存过滤前后的细胞数量统计
+filter_stats <- data.frame(
+  Sample = character(),      # 样本名称
+  Before = numeric(),        # 过滤前细胞数
+  After = numeric(),         # 过滤后细胞数
+  Retention_Rate = numeric(),# 细胞保留率(%)
+  stringsAsFactors = FALSE
+)
+
+# 对每个样本进行质控过滤
+for(i in 1:length(scRNAlist)) {
+  x <- scRNAlist[[i]]        # 获取当前样本
+  cells_before <- ncol(x)    # 记录过滤前细胞数
+  
+  # 使用固定的宽松阈值进行细胞过滤
+  # 这些阈值基于常见单细胞数据的经验值设置
+  x_filtered <- subset(x, 
+                      subset = nFeature_RNA > 200 &     # 至少表达200个基因
+                              nFeature_RNA < 8000 &     # 基因数上限，避免双胞体
+                              nCount_RNA > 500 &        # 最低UMI计数要求
+                              nCount_RNA < 50000 &      # UMI计数上限，避免异常细胞
+                              mt_percent < 20 &         # 线粒体比例上限，过高表示细胞死亡
+                              HB_percent < 10)          # 血红蛋白比例上限，避免红细胞污染
+  
+  # 计算过滤后的细胞数和保留率
+  cells_after <- ncol(x_filtered)
+  retention_rate <- round((cells_after / cells_before) * 100, 2)
+  
+  # 更新过滤统计信息
+  filter_stats <- rbind(filter_stats, data.frame(
+    Sample = x@project.name,
+    Before = cells_before,
+    After = cells_after,
+    Retention_Rate = retention_rate
+  ))
+  
+  # 输出每个样本的过滤结果
+  cat(paste0("样本 ", i, ": ", cells_before, " -> ", cells_after, 
+             " (", retention_rate, "%)\n"))
+  
+  # 用过滤后的对象替换原对象
+  scRNAlist[[i]] <- x_filtered
+}
+
+# 输出过滤完成信息和统计表
+print("质控过滤完成!")
+print(filter_stats)
+```
+
+## 6. Doublet检测
+
+本段代码实现了对单细胞RNA测序数据中双胞体(doublet)的检测与过滤，这是提高数据质量的关键步骤。我们使用DoubletFinder算法，该算法通过模拟人工双胞体并评估与真实数据的相似性来识别可能的双胞体。代码首先根据样本的细胞数量估计预期双胞体率（细胞数越多，双胞体率越高），然后考虑了同源双胞体（来自相同细胞类型）的影响，并通过参数扫描确定最优的pK值（影响检测灵敏度的关键参数）。这种综合方法能有效识别技术伪影产生的双胞体，同时保留真实的生物信号，显著提高下游分析的可靠性
+
+```{r Doublet}
+# 根据细胞数量估计doublet率 - 10X Genomics官方建议的双胞体率估计函数
+# 细胞数越多，双胞体率越高，这与微流控芯片上的细胞捕获原理相关
+numb <- function(x) {
+  if (x <= 2000) return(0.008)       # 0.8%
+  else if (x <= 4000) return(0.016)  # 1.6%
+  else if (x <= 6000) return(0.024)  # 2.4%
+  else if (x <= 8000) return(0.032)  # 3.2%
+  else if (x <= 10000) return(0.04)  # 4.0%
+  else if (x <= 12000) return(0.048) # 4.8%
+  else if (x <= 14000) return(0.056) # 5.6%
+  else if (x <= 16000) return(0.064) # 6.4%
+  else if (x <= 18000) return(0.072) # 7.2%
+  else return(0.08)                  # 8.0%
+}
+
+# 初始化Doublet检测统计表
+doublet_summary <- data.frame(
+  Sample = character(),            # 样本名称
+  Cells_Before = numeric(),        # 检测前细胞数
+  Cells_After = numeric(),         # 检测后细胞数
+  Doublets_Removed = numeric(),    # 移除的双胞体数
+  Doublet_Rate = numeric(),        # 实际双胞体率(%)
+  Expected_Rate = numeric(),       # 预期双胞体率(%)
+  Optimal_pK = numeric(),          # 最优pK参数值
+  Homotypic_Prop = numeric(),      # 同源双胞体比例(%)
+  Processing_Time = numeric(),     # 处理时间(分钟)
+  stringsAsFactors = FALSE
+)
+
+print("开始doublet检测...")
+
+# 对每个样本进行双胞体检测
+for(i in 1:length(scRNAlist)){
+  start_time <- Sys.time()  # 记录开始时间
+  
+  cat(paste0("样本 ", i, "/", length(scRNAlist), " doublet检测中...\n"))
+  
+  seu <- scRNAlist[[i]]
+  cells_before <- ncol(seu)
+  
+  # 跳过细胞数过少的样本，这些样本双胞体率通常较低，且检测可能不准确
+  if(cells_before < 100) {
+    warning(paste0("样本 ", i, " 细胞数过少，跳过doublet检测"))
+    next
+  }
+  
+  # 数据预处理：标准化、特征选择、降维
+  suppressWarnings({
+    seu <- NormalizeData(seu, normalization.method = "LogNormalize", 
+                        scale.factor = 10000, verbose = FALSE)
+    seu <- FindVariableFeatures(seu, selection.method = "vst", 
+                               nfeatures = 2000, verbose = FALSE)
+    seu <- ScaleData(seu, verbose = FALSE)
+    seu <- RunPCA(seu, npcs = 50, verbose = FALSE)
+  })
+  
+  # 根据细胞数量计算预期双胞体率和数量
+  doublet_rate <- numb(cells_before)
+  nExp <- round(doublet_rate * cells_before)
+  
+  # 进行聚类，为同源双胞体估计做准备
+  suppressWarnings({
+    seu <- FindNeighbors(seu, dims = 1:30, verbose = FALSE)
+    # 根据细胞数量动态调整聚类分辨率
+    resolution <- ifelse(cells_before < 1000, 0.3, 
+                        ifelse(cells_before < 3000, 0.5, 0.8))
+    seu <- FindClusters(seu, resolution = resolution, verbose = FALSE)
+  })
+  
+  # 计算同源双胞体比例并调整预期双胞体数量
+  homotypic.prop <- modelHomotypic(seu$seurat_clusters)  # 估计同源双胞体比例
+  nExp_adj <- round(nExp * (1 - homotypic.prop))  # 调整预期双胞体数量
+  # 确保调整后的双胞体数量在合理范围内
+  nExp_adj <- max(1, min(nExp_adj, round(cells_before * 0.12)))
+  
+  # 寻找最优pK值（影响检测灵敏度的关键参数）
+  optimal_pk <- 0.09  # 默认值
+  tryCatch({
+    sweep.res.list <- paramSweep(seu, PCs = 1:30, sct = FALSE)  # 参数扫描
+    sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)   # 汇总结果
+    bcmvn <- find.pK(sweep.stats)  # 找到最佳pK值
+    optimal_pk <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+  }, error = function(e) {
+    cat("  pK优化失败，使用默认值\n")
+  })
+  
+  # 运行DoubletFinder算法
+  seu <- doubletFinder(seu = seu, 
+                       PCs = 1:30,     # 使用前30个主成分
+                       pN = 0.25,      # 模拟双胞体比例
+                       pK = optimal_pk,# 最优pK值
+                       nExp = nExp_adj,# 调整后的预期双胞体数量
+                       sct = FALSE)    # 不使用SCTransform
+  
+  # 获取DoubletFinder结果并添加到元数据
+  df_results <- colnames(seu@meta.data)[grep("DF.classifications", colnames(seu@meta.data))]
+  seu@meta.data$doublet_info <- seu@meta.data[[df_results]]
+  
+  # 过滤出单细胞（移除双胞体）
+  seu_filtered <- subset(seu, subset = doublet_info == "Singlet")
+  
+  # 统计结果
+  cells_after <- ncol(seu_filtered)
+  doublets_removed <- cells_before - cells_after
+  actual_doublet_rate <- round(doublets_removed / cells_before * 100, 2)
+  processing_time <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+  
+  # 更新Seurat对象列表
+  scRNAlist[[i]] <- seu_filtered
+  
+  # 更新统计表
+  doublet_summary <- rbind(doublet_summary, data.frame(
+    Sample = seu@project.name,
+    Cells_Before = cells_before,
+    Cells_After = cells_after,
+    Doublets_Removed = doublets_removed,
+    Doublet_Rate = actual_doublet_rate,
+    Expected_Rate = round(doublet_rate * 100, 1),
+    Optimal_pK = round(optimal_pk, 3),
+    Homotypic_Prop = round(homotypic.prop * 100, 1),
+    Processing_Time = round(processing_time, 2)
+  ))
+  
+  # 输出处理结果
+  cat(paste0("  完成: ", cells_before, " -> ", cells_after, 
+             " (", actual_doublet_rate, "%, ", 
+             round(processing_time, 1), "min)\n"))
+}
+
+print("Doublet检测完成!")
+print(doublet_summary)
+```
+
+## 7. 使用decontX去除污染
+
+本段代码实现了单细胞RNA测序数据中背景RNA污染的检测与去除，这是提高数据质量的重要步骤。我们使用decontX算法（现已整合到celda包中），该算法通过估计每个细胞的污染水平来识别和过滤受到严重背景RNA污染的细胞。在液滴测序技术中，环境中的游离RNA可能会被捕获到液滴中，导致基因表达谱的混杂，特别是当样本制备不理想或细胞裂解严重时。通过移除高污染度（>25%）的细胞，我们可以提高下游分析的准确性，尤其是对低表达基因的分析。代码同时记录了每个样本的污染统计信息，为数据质量评估提供了重要参考
+
+```{r 去弥散RNA}
+library(celda)  # 加载celda包，decontX算法现在是该包的一部分
+
+print("开始使用decontX去除污染...")
+
+# 初始化污染检测统计表
+decontx_stats <- data.frame(
+  Sample = character(),        # 样本名称
+  Before = numeric(),          # 处理前细胞数
+  After = numeric(),           # 处理后细胞数
+  Removal_Rate = numeric(),    # 细胞移除率(%)
+  Mean_Contamination = numeric(),  # 平均污染度
+  stringsAsFactors = FALSE
+)
+
+# 对每个样本进行污染检测和过滤
+for(i in 1:length(scRNAlist)){
+  # 获取当前样本的Seurat对象
+  seu <- scRNAlist[[i]]
+  cells_before <- ncol(seu)
+  
+  # 提取原始计数矩阵用于decontX分析
+  counts <- GetAssayData(seu, slot = "counts")
+  
+  # 运行decontX算法估计每个细胞的污染水平
+  print(paste0("对样本 ", i, " 运行decontX..."))
+  decontX_results <- decontX(counts)  # decontX算法计算每个细胞的污染得分
+  
+  # 将污染得分添加到Seurat对象的元数据中
+  seu$Contamination <- decontX_results$contamination
+  
+  # 过滤高污染细胞（污染度>25%的细胞被移除）
+  print(paste0("样本 ", i, " 过滤前细胞数: ", ncol(seu)))
+  seu <- subset(seu, subset = Contamination < 0.25)
+  cells_after <- ncol(seu)
+  
+  # 计算和更新统计信息
+  removal_rate <- round((cells_before - cells_after) / cells_before * 100, 2)  # 细胞移除率
+  mean_contamination <- round(mean(decontX_results$contamination), 4)  # 平均污染度
+  
+  # 更新统计表
+  decontx_stats <- rbind(decontx_stats, data.frame(
+    Sample = seu@project.name,
+    Before = cells_before,
+    After = cells_after,
+    Removal_Rate = removal_rate,
+    Mean_Contamination = mean_contamination
+  ))
+  
+  # 输出处理结果
+  print(paste0("样本 ", i, " 过滤后细胞数: ", cells_after, 
+               " (移除率: ", removal_rate, "%, 平均污染度: ", mean_contamination, ")"))
+  
+  # 更新列表中的Seurat对象
+  scRNAlist[[i]] <- seu
+}
+
+# 输出处理完成信息和统计表
+print("decontX处理完成!")
+print(decontx_stats)
+```
+
+## 8. 合并所有样本
+
+本段代码实现了多个单细胞RNA测序样本的合并操作，是整合分析的关键步骤。当研究包含多个样本时，将它们合并为一个Seurat对象可以实现跨样本比较和综合分析，有助于识别共有和特异的细胞类型与状态。代码通过Seurat的merge函数将所有样本整合到一个对象中，同时为每个细胞添加来源样本的标识，确保细胞身份可追溯。合并后，我们统计了各样本的细胞分布情况，这对评估样本间的平衡性和后续分析中可能的批次效应至关重要。这一步为后续的标准化、批次校正和整合分析奠定了基础
+
+```{r merge}
+# 合并所有样本 - 将多个样本的数据整合到一个Seurat对象中
+print("合并所有样本...")
+
+# 判断是否有多个样本需要合并
+if(length(scRNAlist) > 1) {
+  # 使用Seurat的merge函数合并样本
+  # x参数为第一个样本，y参数为剩余所有样本
+  # add.cell.ids参数为每个样本添加唯一前缀，防止细胞ID冲突
+  scRNAlist_merge <- merge(x = scRNAlist[[1]], 
+                           y = scRNAlist[-1], 
+                           add.cell.ids = sapply(scRNAlist, function(x) x@project.name))
+  
+  # 输出合并结果信息
+  print(paste0("成功合并 ", length(scRNAlist), " 个样本，共 ", ncol(scRNAlist_merge), " 个细胞"))
+} else {
+  # 如果只有一个样本，直接使用该样本
+  scRNAlist_merge <- scRNAlist[[1]]
+  print("只有一个样本，无需合并")
+}
+
+# 统计合并后各样本的细胞数量分布
+sample_counts <- table(scRNAlist_merge$orig.ident)
+print("合并后各样本细胞数:")
+print(sample_counts)
+
+# 将样本标识转换为因子类型，便于后续分析和可视化
+# 这确保了样本在图表和分析中的顺序是可控的
+scRNAlist_merge@meta.data$orig.ident <- as.factor(scRNAlist_merge@meta.data$orig.ident)
+print("样本组别:")
+print(levels(scRNAlist_merge@meta.data$orig.ident))
+```
+
+## 9. 保存结果
+
+```{r}
+# 保存RDS文件
+saveRDS(scRNAlist_merge, file = "gfp_09m28d.rds")
+print("数据已保存为: gfp_07m15d.rds")
+```
+
+## 10. 转换为h5ad格式
+
+本段代码实现了Seurat对象到AnnData格式(h5ad文件)的转换，这是连接R和Python单细胞分析生态系统的重要桥梁。我们使用sceasy包进行格式转换，该包专为单细胞数据格式之间的互操作性而设计。在转换之前，代码先执行了两个关键步骤：合并Seurat对象中的数据层(counts、data和scale.data)以保留完整信息，以及将新版Seurat(v5)的Assay5对象降级为标准Assay格式以确保兼容性。这种转换使得研究人员可以在Seurat和Scanpy等工具之间无缝切换，充分利用两个平台的优势进行综合分析
+
+```{r}
+# 加载sceasy包 - 用于单细胞数据格式转换的工具包
+library(sceasy)  # 加载sceasy包
+
+# 准备转换
+print("准备转换为h5ad格式...")
+
+# 合并Seurat对象中的数据层(layers)
+# 这是Seurat v5的特性，确保counts、data和scale.data等层都被保存
+scRNAlist_merge[["RNA"]] <- JoinLayers(scRNAlist_merge[["RNA"]])
+
+# 将Assay5对象降级为标准Assay对象以确保兼容性
+# 这是因为sceasy可能不完全支持最新的Seurat v5 Assay5格式
+scRNAlist_merge[["RNA"]] <- as(scRNAlist_merge[["RNA"]], "Assay")
+
+# 执行格式转换，从Seurat对象转换为AnnData格式
+print("开始转换为h5ad格式...")
+conversion_time <- system.time({  # 记录转换所需时间
+  convertFormat(scRNAlist_merge,  # 要转换的Seurat对象
+                from="seurat",     # 源格式
+                to="anndata",      # 目标格式
+                outFile='gfp_07m15d.h5ad')  # 输出文件名
+})
+
+# 输出转换完成信息
+print(paste0("转换完成，耗时: ", round(conversion_time[3], 2), " 秒"))
+print("数据已保存为: gfp_07m15d.h5ad")
+```
+
+## 11. 处理流程总结
+
+本段代码创建了单细胞RNA测序数据处理流程的全面总结，包括统计表格和可视化图表。我们追踪了从原始液滴到最终高质量细胞的每一个处理步骤，记录了细胞数量的变化和保留率。这种系统性的总结对于评估数据处理的效果、识别可能的瓶颈步骤以及确保处理流程的透明度和可重复性至关重要。通过细胞数量变化图和累计保留率图，我们可以直观地了解每个质控步骤的影响，这对于优化处理流程参数和理解数据质量特征具有重要价值。所有结果都被保存为CSV文件和PDF图表，便于后续报告和发表
+
+```{r}
+# 创建总结表 - 记录数据处理各阶段的细胞数量和比例变化
+summary_table <- data.frame(
+  Step = c("原始液滴数", "初步过滤后", "质控过滤后", "Doublet过滤后", "污染过滤后", "最终细胞数"),
+  Cell_Count = c(
+    sum(loading_stats$Raw_Droplets),               # 所有样本的原始液滴总数
+    sum(loading_stats$Called_Cells),               # 初步鉴定为细胞的液滴数
+    sum(filter_stats$After),                       # 质控过滤后的细胞数
+    sum(doublet_summary$Cells_After),              # 双胞体过滤后的细胞数
+    sum(decontx_stats$After),                      # 污染过滤后的细胞数
+    ncol(scRNAlist_merge)                          # 最终合并对象中的细胞数
+  ),
+  Percentage = c(
+    100,                                           # 原始液滴占比(100%)
+    round(sum(loading_stats$Called_Cells) / sum(loading_stats$Raw_Droplets) * 100, 2),  # 初步过滤保留率
+    round(sum(filter_stats$After) / sum(loading_stats$Called_Cells) * 100, 2),          # 质控过滤保留率
+    round(sum(doublet_summary$Cells_After) / sum(filter_stats$After) * 100, 2),         # 双胞体过滤保留率
+    round(sum(decontx_stats$After) / sum(doublet_summary$Cells_After) * 100, 2),        # 污染过滤保留率
+    round(ncol(scRNAlist_merge) / sum(loading_stats$Raw_Droplets) * 100, 2)             # 总体保留率
+  )
+)
+
+# 添加累计百分比 - 计算相对于原始液滴数的累计保留率
+summary_table$Cumulative_Percentage <- c(
+  100,                                           # 原始液滴累计保留率(100%)
+  summary_table$Percentage[2],                   # 初步过滤累计保留率
+  summary_table$Percentage[2] * summary_table$Percentage[3] / 100,                 # 质控过滤累计保留率
+  summary_table$Percentage[2] * summary_table$Percentage[3] * summary_table$Percentage[4] / 10000,         # 双胞体过滤累计保留率
+  summary_table$Percentage[2] * summary_table$Percentage[3] * summary_table$Percentage[4] * summary_table$Percentage[5] / 1000000,  # 污染过滤累计保留率
+  summary_table$Percentage[6]                    # 最终累计保留率(与总体保留率相同)
+)
+
+# 显示处理流程总结表
+print("=== 处理流程总结 ===")
+print(summary_table)
+
+# 保存总结表为CSV文件
+write.csv(summary_table, "processing_summary.csv", row.names = FALSE)
+print("处理流程总结已保存至: processing_summary.csv")
+
+# 加载ggplot2包用于数据可视化
+library(ggplot2)
+
+# 准备绘图数据 - 设置步骤为有序因子以保持顺序
+plot_data <- summary_table
+plot_data$Step <- factor(plot_data$Step, levels = plot_data$Step)
+
+# 绘制细胞数量变化图 - 展示各处理步骤后的细胞数量
+cell_count_plot <- ggplot(plot_data, aes(x = Step, y = Cell_Count)) +
+  geom_bar(stat = "identity", fill = "steelblue") +           # 创建柱状图
+  geom_text(aes(label = Cell_Count), vjust = -0.5, size = 3.5) +  # 添加数值标签
+  theme_minimal() +                                           # 使用简洁主题
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  # 旋转x轴标签以避免重叠
+  labs(title = "细胞数量变化", x = "处理步骤", y = "细胞数量")  # 添加标题和轴标签
+
+# 绘制保留率变化图 - 展示各处理步骤后的累计保留率
+retention_plot <- ggplot(plot_data, aes(x = Step, y = Cumulative_Percentage)) +
+  geom_bar(stat = "identity", fill = "coral") +              # 创建柱状图
+  geom_text(aes(label = paste0(round(Cumulative_Percentage, 2), "%")), vjust = -0.5, size = 3.5) +  # 添加百分比标签
+  theme_minimal() +                                          # 使用简洁主题
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) + # 旋转x轴标签
+  labs(title = "细胞保留率变化", x = "处理步骤", y = "累计保留率 (%)")  # 添加标题和轴标签
+
+# 在R Markdown中显示图表
+print(cell_count_plot)
+print(retention_plot)
+
+# 保存图表为PDF文件
+ggsave("cell_count_changes.pdf", cell_count_plot, width = 8, height = 6)
+ggsave("retention_rate_changes.pdf", retention_plot, width = 8, height = 6)
+print("处理流程图已保存")
+```
+
