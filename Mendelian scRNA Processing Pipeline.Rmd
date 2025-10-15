@@ -1,0 +1,655 @@
+---
+title: "Mendelian scRNA Processing Pipeline"
+author: "Joe"
+date: "2025-10-15"
+output: html_document
+---
+
+## Setup and Environment Configuration
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(include = FALSE)
+knitr::opts_knit$set(root.dir = "/home/lin/CRC/GSE/CRCsc")
+library(ggplot2)
+
+# Configure Chinese font support based on OS
+if(Sys.info()["sysname"] == "Darwin") {  # macOS
+  library(showtext)
+  showtext_auto()
+  tryCatch({
+    font_add("chinese", "/System/Library/Fonts/PingFang.ttc")
+  }, error = function(e) {
+    tryCatch({
+      font_add("chinese", "/System/Library/Fonts/STHeiti Light.ttc")
+    }, error = function(e) {
+      font_add("chinese", "/System/Library/Fonts/Arial Unicode MS.ttf")
+    })
+  })
+  theme_set(theme_minimal(base_family = "chinese"))
+  par(family = "chinese")
+} else if(Sys.info()["sysname"] == "Linux") {  # Linux
+  library(showtext)
+  showtext_auto()
+  tryCatch({
+    font_add("chinese", "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc")
+  }, error = function(e) {
+    tryCatch({
+      font_add("chinese", "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf")
+    }, error = function(e) {
+      message("未找到中文字体，可能影响中文显示效果")
+    })
+  })
+  theme_set(theme_minimal(base_family = "chinese"))
+  par(family = "chinese")
+}
+
+# Load necessary packages for scRNA-seq analysis
+suppressPackageStartupMessages({
+  library(Seurat)
+  library(harmony)
+  library(tidyverse)
+  library(dplyr)
+  library(patchwork)
+  library(ggplot2)
+  library(cowplot)
+  library(DoubletFinder)
+  library(DropletUtils)
+  library(scater)
+  library(scran)
+})
+
+# Clean environment
+rm(list = ls())
+
+```
+
+## 1. Batch Loading of GEO scRNA Data with Empty Droplet Detection
+
+```{r Batch, include=FALSE}
+# Batch load all 10X folders in GEOscRNA directory with empty droplet detection
+dir_name <- list.files('/home/lin/CRC/GSE/GEOscRNA/')
+scRNAlist <- list()
+loading_stats <- data.frame(
+  Sample = character(),
+  Raw_Droplets = numeric(),
+  Called_Cells = numeric(),
+  Cell_Rate = numeric(),
+  Method_Used = character(),
+  stringsAsFactors = FALSE
+)
+
+for(i in seq_along(dir_name)){
+  counts <- Read10X(data.dir = file.path("/home/lin/CRC/GSE/GEOscRNA/", dir_name[i]))
+  raw_droplets <- ncol(counts)
+  method_used <- "Direct"
+
+  if(raw_droplets > 1000) {
+    total_counts <- Matrix::colSums(counts)
+    low_count_droplets <- sum(total_counts <= 100 & total_counts > 0)
+    high_count_droplets <- sum(total_counts > 1000)
+    
+    if(low_count_droplets >= 100 && high_count_droplets >= 100) {
+      tryCatch({
+        e.out <- emptyDrops(counts, lower = 100, niters = 3000, test.ambient = TRUE)
+        is_cell <- e.out$FDR <= 0.01 & !is.na(e.out$FDR)
+        if(sum(is_cell) > 50) {
+          counts <- counts[, is_cell]
+          method_used <- "EmptyDrops"
+        } else {
+          counts <- counts[, total_counts > 1000]
+          method_used <- "UMI_Threshold_1000"
+        }
+      }, error = function(e) {
+        total_counts <- Matrix::colSums(counts)
+        threshold <- if(median(total_counts) > 2000) 1000
+                     else if(median(total_counts) > 1000) 500
+                     else 200
+        counts <<- counts[, total_counts > threshold]
+        method_used <<- paste0("UMI_Threshold_", threshold)
+      })
+    } else {
+      total_counts <- Matrix::colSums(counts)
+      counts <- counts[, total_counts > 1000]
+      method_used <- "UMI_Threshold_1000"
+    }
+  } else {
+    total_counts <- Matrix::colSums(counts)
+    threshold <- ifelse(median(total_counts) > 500, 500, 200)
+    counts <- counts[, total_counts > threshold]
+    method_used <- paste0("UMI_Threshold_", threshold, "_Small")
+  }
+
+  called_cells_final <- ncol(counts)
+  cell_rate <- round((called_cells_final / raw_droplets) * 100, 2)
+
+  if(called_cells_final < 50) {
+    counts <- Read10X(data.dir = file.path("/home/lin/CRC/GSE/GEOscRNA/", dir_name[i]))
+    total_counts <- Matrix::colSums(counts)
+    counts <- counts[, total_counts > 100]
+    called_cells_final <- ncol(counts)
+    cell_rate <- round((called_cells_final / raw_droplets) * 100, 2)
+    method_used <- paste0(method_used, "_Lowered")
+  }
+
+  if(called_cells_final > 0) {
+    scRNAlist[[dir_name[i]]] <- CreateSeuratObject(
+      counts,
+      project = dir_name[i],
+      min.cells = 3,
+      min.features = 200
+    )
+  } else {
+    scRNAlist[[dir_name[i]]] <- NULL
+  }
+
+  loading_stats <- rbind(loading_stats, data.frame(
+    Sample = dir_name[i],
+    Raw_Droplets = raw_droplets,
+    Called_Cells = called_cells_final,
+    Cell_Rate = cell_rate,
+    Method_Used = method_used
+  ))
+}
+
+# Remove empty objects
+scRNAlist <- scRNAlist[!sapply(scRNAlist, is.null)]
+
+# Process GSE200997 CSV data
+count_file <- "/home/lin/CRC/GSE/GSE200997/GSE200997_GEO_processed_CRC_10X_raw_UMI_count_matrix.csv.gz"
+anno_file <- "/home/lin/CRC/GSE/GSE200997/GSE200997_GEO_processed_CRC_10X_cell_annotation.csv.gz"
+
+read_count_matrix <- function(file) {
+  first_line <- readLines(file, n = 1)
+  sep <- ifelse(grepl(",", first_line), ",", "\t")
+  dt <- data.table::fread(file, data.table = FALSE, sep = sep)
+  rownames(dt) <- dt[, 1]
+  dt <- dt[, -1]
+  as.matrix(dt)
+}
+expr_mat <- read_count_matrix(count_file)
+
+read_metadata <- function(file, seurat_obj) {
+  first_line <- readLines(file, n = 1)
+  sep <- ifelse(grepl(",", first_line), ",", "\t")
+  meta <- data.table::fread(file, data.table = FALSE, sep = sep, header = TRUE)
+  rownames(meta) <- meta[, 1]
+  meta <- meta[, -1, drop = FALSE]
+  meta <- meta[colnames(seurat_obj), , drop = FALSE]
+  return(meta)
+}
+seurat_obj_gse200997 <- Seurat::CreateSeuratObject(counts = expr_mat, project = "GSE200997", min.cells = 3, min.features = 200)
+meta <- read_metadata(anno_file, seurat_obj_gse200997)
+seurat_obj_gse200997 <- Seurat::AddMetaData(seurat_obj_gse200997, meta)
+
+# Split by samples field and create separate Seurat objects
+samples_list <- unique(seurat_obj_gse200997@meta.data$samples)
+gse200997_split <- list()
+for (s in samples_list) {
+  cells <- rownames(seurat_obj_gse200997@meta.data)[seurat_obj_gse200997@meta.data$samples == s]
+  if (length(cells) > 0) {
+    obj <- subset(seurat_obj_gse200997, cells = cells)
+    obj@project.name <- s # Use biological sample name as project.name
+    gse200997_split[[s]] <- obj
+  }
+}
+
+# Combine all samples
+scRNAlist_all <- c(scRNAlist, gse200997_split)
+
+```
+
+## 2. Species-Specific Parameter Configuration
+
+```{r Parameter, include=FALSE}
+# Set species configuration
+SPECIES <- "human"
+
+# Define species-specific gene annotation patterns
+species_config <- list(
+  human = list(
+    mt_pattern = "^MT-",
+    ribo_pattern = "^RP[SL]",
+    hb_genes = c("HBA1", "HBA2", "HBB", "HBD", "HBE1", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ"),
+    species_name = "Human"
+  ),
+  mouse = list(
+    mt_pattern = "^mt-",
+    ribo_pattern = "^Rp[sl]",
+    hb_genes = c("Hba-a1", "Hba-a2", "Hbb-bs", "Hbb-bt", "Hbb-bh1", "Hbb-bh2", "Hbb-y", "Hbe1"),
+    species_name = "Mouse"
+  ),
+  rat = list(
+    mt_pattern = "^Mt",
+    ribo_pattern = "^Rp[sl]",
+    hb_genes = c("Hba1", "Hba2", "Hbb"),
+    species_name = "Rat"
+  ),
+  zebrafish = list(
+    mt_pattern = "^mt",
+    ribo_pattern = "^rp[sl]",
+    hb_genes = c("hbaa1", "hbaa2", "hbae1", "hbae3", "hbba1", "hbba2", "hbbe1"),
+    species_name = "Zebrafish"
+  )
+)
+
+# Validate species configuration
+current_config <- species_config[[SPECIES]]
+if(is.null(current_config)) {
+  stop(paste0("Unsupported species: '", SPECIES, "'! Supported species: ", 
+              paste(names(species_config), collapse = ", ")))
+}
+
+```
+
+## 3. Calculate QC Metrics
+
+```{r QC Metrics, include=FALSE}
+scRNAlist <- scRNAlist_all
+
+# Initialize QC summary dataframe
+qc_summary <- data.frame(
+  Sample = 1:length(scRNAlist),
+  Sample_Name = sapply(scRNAlist, function(x) x@project.name),
+  Cells = sapply(scRNAlist, ncol),
+  MT_genes_found = NA,
+  HB_genes_found = NA,
+  Ribo_genes_found = NA,
+  Mean_MT_percent = NA,
+  Mean_HB_percent = NA,
+  Mean_Ribo_percent = NA,
+  Median_nUMI = NA,
+  Median_nGene = NA,
+  stringsAsFactors = FALSE
+)
+
+# Process each sample
+for(i in 1:length(scRNAlist)) {
+  seu <- scRNAlist[[i]]
+  all_genes <- rownames(seu)
+  
+  # Identify specific gene types based on species configuration
+  mt_genes <- grep(current_config$mt_pattern, all_genes, value = TRUE, ignore.case = TRUE)
+  ribo_genes <- grep(current_config$ribo_pattern, all_genes, value = TRUE, ignore.case = TRUE)
+  hb_genes_present <- intersect(current_config$hb_genes, all_genes)
+  
+  # If no hemoglobin genes found by direct match, try case-insensitive matching
+  if(length(hb_genes_present) == 0) {
+    hb_genes_present <- all_genes[toupper(all_genes) %in% toupper(current_config$hb_genes)]
+  }
+  
+  # Calculate basic QC metrics
+  seu$nUMI <- Matrix::colSums(GetAssayData(seu, slot = "counts"))
+  seu$nGene <- Matrix::colSums(GetAssayData(seu, slot = "counts") > 0)
+  
+  # Calculate mitochondrial gene percentage
+  if(length(mt_genes) > 0) {
+    seu <- PercentageFeatureSet(seu, pattern = current_config$mt_pattern, col.name = "mt_percent")
+  } else {
+    seu$mt_percent <- 0
+  }
+  
+  # Calculate hemoglobin gene percentage
+  if(length(hb_genes_present) > 0) {
+    seu <- PercentageFeatureSet(seu, features = hb_genes_present, col.name = "HB_percent")
+  } else {
+    seu$HB_percent <- 0
+  }
+  
+  # Calculate ribosomal gene percentage
+  if(length(ribo_genes) > 0) {
+    seu <- PercentageFeatureSet(seu, pattern = current_config$ribo_pattern, col.name = "ribo_percent")
+  } else {
+    seu$ribo_percent <- 0
+  }
+  
+  # Calculate derived metrics
+  seu$gene_complexity <- seu$nGene / seu$nUMI
+  seu$log10_nUMI <- log10(seu$nUMI)
+  seu$log10_nGene <- log10(seu$nGene)
+  
+  # Update Seurat object in the list
+  scRNAlist[[i]] <- seu
+  
+  # Update QC summary table
+  qc_summary[i, c("MT_genes_found", "HB_genes_found", "Ribo_genes_found",
+                  "Mean_MT_percent", "Mean_HB_percent", "Mean_Ribo_percent",
+                  "Median_nUMI", "Median_nGene")] <- 
+    c(length(mt_genes), length(hb_genes_present), length(ribo_genes),
+      round(mean(seu$mt_percent), 2), round(mean(seu$HB_percent), 2), 
+      round(mean(seu$ribo_percent), 2),
+      round(median(seu$nUMI), 0), round(median(seu$nGene), 0))
+}
+
+# Save QC summary to CSV
+write.csv(qc_summary, paste0("QC_summary_", SPECIES, "_", Sys.Date(), ".csv"), row.names = FALSE)
+
+```
+
+## 4. Pre-QC Visualization
+
+```{r Pre-QC include=FALSE}
+# Initialize list to store violin plots
+violin_before <- list()
+
+# Create QC violin plots for each sample
+for(i in 1:length(scRNAlist)){
+  if(!is.null(scRNAlist[[i]]) && ncol(scRNAlist[[i]]) > 0) {
+    sample_name <- scRNAlist[[i]]@project.name
+    
+    violin_before[[i]] <- VlnPlot(scRNAlist[[i]],
+                                  features = c("nFeature_RNA", "nCount_RNA", 
+                                               "mt_percent", "HB_percent", "ribo_percent"), 
+                                  pt.size = 0.01,
+                                  ncol = 5) +
+      plot_annotation(title = paste0("Sample ", i, " (", sample_name, ") - Before QC"),
+                      theme = theme(plot.title = element_text(hjust = 0.5, size = 14)))
+  } else {
+    violin_before[[i]] <- NULL
+  }
+}
+
+# Remove NULL elements
+violin_before <- violin_before[!sapply(violin_before, is.null)]
+
+```
+
+## 5. QC Filtering
+
+```{r QC Filtering, include=FALSE}
+# Initialize filtering statistics dataframe
+filter_stats <- data.frame(
+  Sample = character(),
+  Before = numeric(),
+  After = numeric(),
+  Retention_Rate = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Apply QC filtering to each sample
+for(i in 1:length(scRNAlist)) {
+  x <- scRNAlist[[i]]
+  cells_before <- ncol(x)
+  
+  # Filter cells using fixed thresholds
+  x_filtered <- subset(x, 
+                      subset = nFeature_RNA > 200 &
+                              nFeature_RNA < 8000 &
+                              nCount_RNA > 500 &
+                              nCount_RNA < 50000 &
+                              mt_percent < 20 &
+                              HB_percent < 10)
+  
+  # Calculate retention rate
+  cells_after <- ncol(x_filtered)
+  retention_rate <- round((cells_after / cells_before) * 100, 2)
+  
+  # Update statistics
+  filter_stats <- rbind(filter_stats, data.frame(
+    Sample = x@project.name,
+    Before = cells_before,
+    After = cells_after,
+    Retention_Rate = retention_rate
+  ))
+  
+  # Replace original object with filtered object
+  scRNAlist[[i]] <- x_filtered
+}
+
+```
+
+## 6. Doublet Detection
+
+```{r Doublet, include=FALSE}
+# Define function to estimate doublet rate based on cell count
+numb <- function(x) {
+  if (x <= 2000) return(0.008)
+  else if (x <= 4000) return(0.016)
+  else if (x <= 6000) return(0.024)
+  else if (x <= 8000) return(0.032)
+  else if (x <= 10000) return(0.04)
+  else if (x <= 12000) return(0.048)
+  else if (x <= 14000) return(0.056)
+  else if (x <= 16000) return(0.064)
+  else if (x <= 18000) return(0.072)
+  else return(0.08)
+}
+
+# Initialize doublet detection summary
+doublet_summary <- data.frame(
+  Sample = character(),
+  Cells_Before = numeric(),
+  Cells_After = numeric(),
+  Doublets_Removed = numeric(),
+  Doublet_Rate = numeric(),
+  Expected_Rate = numeric(),
+  Optimal_pK = numeric(),
+  Homotypic_Prop = numeric(),
+  Processing_Time = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Process each sample for doublet detection
+for(i in 1:length(scRNAlist)){
+  start_time <- Sys.time()
+  
+  seu <- scRNAlist[[i]]
+  cells_before <- ncol(seu)
+  
+  # Skip samples with too few cells
+  if(cells_before < 100) {
+    next
+  }
+  
+  # Data preprocessing
+  suppressWarnings({
+    seu <- NormalizeData(seu, normalization.method = "LogNormalize", 
+                        scale.factor = 10000, verbose = FALSE)
+    seu <- FindVariableFeatures(seu, selection.method = "vst", 
+                               nfeatures = 2000, verbose = FALSE)
+    seu <- ScaleData(seu, verbose = FALSE)
+    seu <- RunPCA(seu, npcs = 50, verbose = FALSE)
+  })
+  
+  # Calculate expected doublet rate and count
+  doublet_rate <- numb(cells_before)
+  nExp <- round(doublet_rate * cells_before)
+  
+  # Clustering for homotypic doublet estimation
+  suppressWarnings({
+    seu <- FindNeighbors(seu, dims = 1:30, verbose = FALSE)
+    resolution <- ifelse(cells_before < 1000, 0.3, 
+                        ifelse(cells_before < 3000, 0.5, 0.8))
+    seu <- FindClusters(seu, resolution = resolution, verbose = FALSE)
+  })
+  
+  # Calculate homotypic proportion and adjust expected doublets
+  homotypic.prop <- modelHomotypic(seu$seurat_clusters)
+  nExp_adj <- round(nExp * (1 - homotypic.prop))
+  nExp_adj <- max(1, min(nExp_adj, round(cells_before * 0.12)))
+  
+  # Find optimal pK value
+  optimal_pk <- 0.09  # Default value
+  tryCatch({
+    sweep.res.list <- paramSweep(seu, PCs = 1:30, sct = FALSE)
+    sweep.stats <- summarizeSweep(sweep.res.list, GT = FALSE)
+    bcmvn <- find.pK(sweep.stats)
+    optimal_pk <- as.numeric(as.character(bcmvn$pK[which.max(bcmvn$BCmetric)]))
+  }, error = function(e) {
+    # Use default if optimization fails
+  })
+  
+  # Run DoubletFinder
+  seu <- doubletFinder(seu = seu, 
+                       PCs = 1:30,
+                       pN = 0.25,
+                       pK = optimal_pk,
+                       nExp = nExp_adj,
+                       sct = FALSE)
+  
+  # Get DoubletFinder results
+  df_results <- colnames(seu@meta.data)[grep("DF.classifications", colnames(seu@meta.data))]
+  seu@meta.data$doublet_info <- seu@meta.data[[df_results]]
+  
+  # Filter singlets
+  seu_filtered <- subset(seu, subset = doublet_info == "Singlet")
+  
+  # Calculate statistics
+  cells_after <- ncol(seu_filtered)
+  doublets_removed <- cells_before - cells_after
+  actual_doublet_rate <- round(doublets_removed / cells_before * 100, 2)
+  processing_time <- as.numeric(difftime(Sys.time(), start_time, units = "mins"))
+  
+  # Update Seurat object
+  scRNAlist[[i]] <- seu_filtered
+  
+  # Update summary
+  doublet_summary <- rbind(doublet_summary, data.frame(
+    Sample = seu@project.name,
+    Cells_Before = cells_before,
+    Cells_After = cells_after,
+    Doublets_Removed = doublets_removed,
+    Doublet_Rate = actual_doublet_rate,
+    Expected_Rate = round(doublet_rate * 100, 1),
+    Optimal_pK = round(optimal_pk, 3),
+    Homotypic_Prop = round(homotypic.prop * 100, 1),
+    Processing_Time = round(processing_time, 2)
+  ))
+}
+
+```
+
+## 7. Background RNA Contamination Removal with decontX
+
+```{r decontX include=FALSE}
+library(celda)
+
+# Initialize decontX statistics
+decontx_stats <- data.frame(
+  Sample = character(),
+  Before = numeric(),
+  After = numeric(),
+  Removal_Rate = numeric(),
+  Mean_Contamination = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Process each sample for contamination detection
+for(i in 1:length(scRNAlist)){
+  seu <- scRNAlist[[i]]
+  cells_before <- ncol(seu)
+  
+  # Extract raw counts for decontX
+  counts <- GetAssayData(seu, slot = "counts")
+  
+  # Run decontX algorithm
+  decontX_results <- decontX(counts)
+  
+  # Add contamination scores to metadata
+  seu$Contamination <- decontX_results$contamination
+  
+  # Filter high contamination cells (>25%)
+  seu <- subset(seu, subset = Contamination < 0.25)
+  cells_after <- ncol(seu)
+  
+  # Calculate statistics
+  removal_rate <- round((cells_before - cells_after) / cells_before * 100, 2)
+  mean_contamination <- round(mean(decontX_results$contamination), 4)
+  
+  # Update statistics
+  decontx_stats <- rbind(decontx_stats, data.frame(
+    Sample = seu@project.name,
+    Before = cells_before,
+    After = cells_after,
+    Removal_Rate = removal_rate,
+    Mean_Contamination = mean_contamination
+  ))
+  
+  # Update Seurat object
+  scRNAlist[[i]] <- seu
+}
+
+```
+
+## 8. Merge All Samples
+
+```{r Merge, include=FALSE}
+# Merge all samples into one Seurat object
+if(length(scRNAlist) > 1) {
+  # Preserve original sample identifiers before merging
+  for(i in 1:length(scRNAlist)) {
+    if("samples" %in% colnames(scRNAlist[[i]]@meta.data)) {
+      # If samples column exists, make sure it's preserved
+      sample_name <- scRNAlist[[i]]@project.name
+      if(is.null(scRNAlist[[i]]@meta.data$original_sample)) {
+        scRNAlist[[i]]$original_sample <- sample_name
+      }
+    } else {
+      # If no samples column, create one with the project name
+      scRNAlist[[i]]$samples <- scRNAlist[[i]]@project.name
+      scRNAlist[[i]]$original_sample <- scRNAlist[[i]]@project.name
+    }
+  }
+  
+  # Merge samples
+  scRNAlist_merge <- merge(x = scRNAlist[[1]], 
+                           y = scRNAlist[-1], 
+                           add.cell.ids = sapply(scRNAlist, function(x) x@project.name))
+  
+  # Ensure samples column is preserved and converted to factor
+  if("samples" %in% colnames(scRNAlist_merge@meta.data)) {
+    scRNAlist_merge@meta.data$samples <- as.factor(scRNAlist_merge@meta.data$samples)
+  } else {
+    # If samples column was lost during merge, recreate from orig.ident
+    scRNAlist_merge@meta.data$samples <- as.factor(scRNAlist_merge@meta.data$orig.ident)
+  }
+  
+  # Ensure original_sample is preserved
+  if("original_sample" %in% colnames(scRNAlist_merge@meta.data)) {
+    scRNAlist_merge@meta.data$original_sample <- as.factor(scRNAlist_merge@meta.data$original_sample)
+  }
+  
+  # Convert orig.ident to factor
+  scRNAlist_merge@meta.data$orig.ident <- as.factor(scRNAlist_merge@meta.data$orig.ident)
+  
+} else {
+  # If only one sample, simply use it
+  scRNAlist_merge <- scRNAlist[[1]]
+  
+  # Ensure samples column exists
+  if(!("samples" %in% colnames(scRNAlist_merge@meta.data))) {
+    scRNAlist_merge$samples <- scRNAlist_merge@project.name
+  }
+  scRNAlist_merge@meta.data$samples <- as.factor(scRNAlist_merge@meta.data$samples)
+  
+  # Ensure orig.ident is a factor
+  scRNAlist_merge@meta.data$orig.ident <- as.factor(scRNAlist_merge@meta.data$orig.ident)
+}
+
+# Check sample distributions
+sample_counts <- table(scRNAlist_merge$orig.ident)
+samples_list <- levels(scRNAlist_merge@meta.data$samples)
+
+```
+
+## 9.Group
+
+```{r group, include=FALSE}
+# 创建group列，根据样本名称分为Tumor和Normal两组
+scRNAlist_merge$group <- ifelse(
+  grepl("_C$|^T_", scRNAlist_merge$samples),  # 如果样本名以_C结尾或以T_开头
+  "Tumor",                                    # 则归类为Tumor组
+  "Normal"                                    # 否则归类为Normal组
+)
+
+# 验证分组结果
+table(scRNAlist_merge$samples, scRNAlist_merge$group)
+table(scRNAlist_merge$group)
+```
+
+
+## 10. Save Results
+
+```{r}
+# Save processed data as RDS file
+saveRDS(scRNAlist_merge, file = "/home/lin/CRC/CRC_scRNA.rds")
+```
+

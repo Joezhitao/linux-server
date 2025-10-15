@@ -1,7 +1,7 @@
 ---
-title: "scRNA_pre"
+title: "Mendelian scRNA"
 author: "Joe"
-date: "2025-09-28"
+date: "2025-10-13"
 output: html_document
 ---
 
@@ -72,120 +72,80 @@ suppressPackageStartupMessages({
 rm(list = ls())
 ```
 
-## 1. 批量读取数据并进行空液滴检测
+## 1. 批量读取 GEOscRNA & 加入 GSE200997 数据，并进行空液滴检测
 
 单细胞RNA测序数据的批量预处理流程，主要通过自动化读取多个10XGenomics格式样本并执行空液滴检测。我们优先采用emptyDrops统计方法识别真实细胞，同时实现了自适应策略以应对不同数据特征，当主要方法不适用时会自动切换到基于UMI阈值的备选方案。整个流程确保了细胞识别的准确性和处理的稳健性，同时详细记录了每个样本的处理统计数据，为后续的质控、归一化和细胞类型注释等分析奠定基础。这种方法相比简单的固定阈值策略，能更有效地保留稀有细胞类型并提高数据质量
 
 ```{r empty drop}
-# 获取目录列表 - 查找所有样本文件夹
-dir_name <- list.files('/home/lin/CRC/GSE/GEOscRNA/')
-print("发现的样本目录:")
-print(dir_name)
+# 1. 批量读取 GEOscRNA 目录下所有 10X 文件夹样本（带空液滴检测）
 
-# 初始化两个重要数据结构：
-# 1. scRNAlist - 用于存储所有样本的Seurat对象
-# 2. loading_stats - 用于记录每个样本的处理统计信息
+dir_name <- list.files('/home/lin/CRC/GSE/GEOscRNA/')
 scRNAlist <- list()
 loading_stats <- data.frame(
-  Sample = character(),        # 样本名称
-  Raw_Droplets = numeric(),    # 原始液滴数量
-  Called_Cells = numeric(),    # 鉴定为细胞的液滴数量
-  Cell_Rate = numeric(),       # 细胞率(%)
-  Method_Used = character(),   # 使用的细胞鉴定方法
+  Sample = character(),
+  Raw_Droplets = numeric(),
+  Called_Cells = numeric(),
+  Cell_Rate = numeric(),
+  Method_Used = character(),
   stringsAsFactors = FALSE
 )
 
-print("开始批量读取数据并进行空液滴检测...")
-
-# 循环处理每个样本目录
-for(i in 1:length(dir_name)){
+for(i in seq_along(dir_name)){
   cat(paste0("处理样本 ", i, ": ", dir_name[i], "\n"))
-  
-  # 读取10X Genomics格式的原始计数矩阵
   counts <- Read10X(data.dir = file.path("/home/lin/CRC/GSE/GEOscRNA/", dir_name[i]))
-  raw_droplets <- ncol(counts)  # 记录原始液滴数量
-  method_used <- "Direct"       # 默认方法标记
-  
+  raw_droplets <- ncol(counts)
+  method_used <- "Direct"
+
   cat(paste0("  原始液滴数: ", raw_droplets, "\n"))
-  
-  # 只对大样本(>1000个液滴)尝试空液滴检测
+
   if(raw_droplets > 1000) {
     cat("  尝试空液滴检测...\n")
-    
     tryCatch({
-      # 计算每个液滴的总UMI计数
       total_counts <- Matrix::colSums(counts)
-      
-      # 评估数据是否适合空液滴检测：需要足够的低计数和高计数液滴
       low_count_droplets <- sum(total_counts <= 100 & total_counts > 0)
       high_count_droplets <- sum(total_counts > 1000)
-      
       cat(paste0("    低计数液滴 (≤100): ", low_count_droplets, "\n"))
       cat(paste0("    高计数液滴 (>1000): ", high_count_droplets, "\n"))
-      
-      # 如果同时有足够的低计数和高计数液滴，使用emptyDrops算法
       if(low_count_droplets >= 100 && high_count_droplets >= 100) {
-        # 运行emptyDrops算法，基于环境RNA背景分布识别真实细胞
-        e.out <- emptyDrops(counts, 
-                           lower = 100,      # 低于此UMI计数的液滴被视为环境RNA
-                           niters = 3000,    # 统计检验的迭代次数
-                           test.ambient = TRUE)  # 测试环境RNA分布
-        
-        # 选择显著的细胞(FDR <= 1%)
+        e.out <- emptyDrops(counts, lower = 100, niters = 3000, test.ambient = TRUE)
         is_cell <- e.out$FDR <= 0.01 & !is.na(e.out$FDR)
-        
-        # 如果检测到足够的细胞(>50)，使用emptyDrops结果
         if(sum(is_cell) > 50) {
-          counts <- counts[, is_cell]  # 只保留被识别为细胞的列
-          method_used <- "EmptyDrops"  # 记录使用的方法
+          counts <- counts[, is_cell]
+          method_used <- "EmptyDrops"
           cat(paste0("    空液滴检测成功，保留 ", sum(is_cell), " 个细胞\n"))
         } else {
-          # 空液滴检测结果太少，使用简单UMI阈值法作为备用
           cat("    空液滴检测结果过少，使用UMI阈值方法\n")
           counts <- counts[, total_counts > 1000]
           method_used <- "UMI_Threshold_1000"
         }
       } else {
-        # 数据分布不适合空液滴检测，使用UMI阈值法
         cat("    数据不适合空液滴检测，使用UMI阈值方法\n")
         counts <- counts[, total_counts > 1000]
         method_used <- "UMI_Threshold_1000"
       }
     }, error = function(e) {
-      # 捕获并处理空液滴检测过程中的任何错误
       cat(paste0("    空液滴检测失败: ", e$message, "\n"))
       cat("    使用UMI阈值方法作为备用\n")
-      
       total_counts <- Matrix::colSums(counts)
-      
-      # 根据数据分布动态选择合适的UMI阈值
-      threshold <- if(median(total_counts) > 2000) 1000 
-                   else if(median(total_counts) > 1000) 500 
+      threshold <- if(median(total_counts) > 2000) 1000
+                   else if(median(total_counts) > 1000) 500
                    else 200
-      
-      # <<- 操作符用于在错误处理函数中修改外部变量
       counts <<- counts[, total_counts > threshold]
       method_used <<- paste0("UMI_Threshold_", threshold)
     })
   } else {
-    # 对于小样本(<1000个液滴)，直接使用UMI阈值法
     cat("  样本较小，直接使用UMI阈值方法\n")
     total_counts <- Matrix::colSums(counts)
-    
-    # 为小样本选择较低的阈值
     threshold <- ifelse(median(total_counts) > 500, 500, 200)
     counts <- counts[, total_counts > threshold]
     method_used <- paste0("UMI_Threshold_", threshold, "_Small")
   }
-  
-  # 记录最终鉴定的细胞数量和比例
+
   called_cells_final <- ncol(counts)
   cell_rate <- round((called_cells_final / raw_droplets) * 100, 2)
-  
-  # 最终安全检查：如果细胞数过少，尝试使用更低的阈值重新处理
+
   if(called_cells_final < 50) {
     cat("  警告：细胞数过少，尝试降低阈值\n")
-    # 重新读取数据并使用更低的阈值(100 UMIs)
     counts <- Read10X(data.dir = file.path("/home/lin/CRC/GSE/GEOscRNA/", dir_name[i]))
     total_counts <- Matrix::colSums(counts)
     counts <- counts[, total_counts > 100]
@@ -193,24 +153,20 @@ for(i in 1:length(dir_name)){
     cell_rate <- round((called_cells_final / raw_droplets) * 100, 2)
     method_used <- paste0(method_used, "_Lowered")
   }
-  
-  # 创建Seurat对象，设置基本质控标准
+
   if(called_cells_final > 0) {
-    scRNAlist[[i]] <- CreateSeuratObject(
-      counts, 
+    scRNAlist[[dir_name[i]]] <- CreateSeuratObject(
+      counts,
       project = dir_name[i],
-      min.cells = 3,     # 只保留在至少3个细胞中表达的基因
-      min.features = 200 # 只保留表达至少200个基因的细胞
+      min.cells = 3,
+      min.features = 200
     )
-    
     cat(paste0("  成功创建Seurat对象\n"))
   } else {
-    # 如果没有检测到有效细胞，记录警告并设为NULL
     warning(paste0("样本 ", i, " 没有检测到有效细胞"))
-    scRNAlist[[i]] <- NULL
+    scRNAlist[[dir_name[i]]] <- NULL
   }
-  
-  # 将本样本的处理结果添加到统计表中
+
   loading_stats <- rbind(loading_stats, data.frame(
     Sample = dir_name[i],
     Raw_Droplets = raw_droplets,
@@ -218,21 +174,62 @@ for(i in 1:length(dir_name)){
     Cell_Rate = cell_rate,
     Method_Used = method_used
   ))
-  
+
   cat(paste0("  最终细胞数: ", called_cells_final, " (", cell_rate, "%) - ", method_used, "\n"))
-  cat(paste(rep("-", 40), collapse = ""), "\n")  # 打印分隔线
+  cat(paste(rep("-", 40), collapse = ""), "\n")
 }
 
-# 从列表中移除空(NULL)样本
+# 移除空对象
 scRNAlist <- scRNAlist[!sapply(scRNAlist, is.null)]
 
-# 显示所有样本的数据加载统计
-print("数据加载统计:")
-print(loading_stats)
+# 现在处理 GSE200997 的 csv 数据，按 samples 字段拆分为多个 Seurat 对象。
 
-# 显示不同细胞鉴定方法的使用频率
-print("\n使用方法统计:")
-print(table(loading_stats$Method_Used))
+# 读取大csv
+count_file <- "/home/lin/CRC/GSE/GSE200997/GSE200997_GEO_processed_CRC_10X_raw_UMI_count_matrix.csv.gz"
+anno_file <- "/home/lin/CRC/GSE/GSE200997/GSE200997_GEO_processed_CRC_10X_cell_annotation.csv.gz"
+
+read_count_matrix <- function(file) {
+  first_line <- readLines(file, n = 1)
+  sep <- ifelse(grepl(",", first_line), ",", "\t")
+  dt <- data.table::fread(file, data.table = FALSE, sep = sep)
+  rownames(dt) <- dt[, 1]
+  dt <- dt[, -1]
+  as.matrix(dt)
+}
+expr_mat <- read_count_matrix(count_file)
+
+read_metadata <- function(file, seurat_obj) {
+  first_line <- readLines(file, n = 1)
+  sep <- ifelse(grepl(",", first_line), ",", "\t")
+  meta <- data.table::fread(file, data.table = FALSE, sep = sep, header = TRUE)
+  rownames(meta) <- meta[, 1]
+  meta <- meta[, -1, drop = FALSE]
+  meta <- meta[colnames(seurat_obj), , drop = FALSE]
+  return(meta)
+}
+seurat_obj_gse200997 <- Seurat::CreateSeuratObject(counts = expr_mat, project = "GSE200997", min.cells = 3, min.features = 200)
+meta <- read_metadata(anno_file, seurat_obj_gse200997)
+seurat_obj_gse200997 <- Seurat::AddMetaData(seurat_obj_gse200997, meta)
+
+# 拆分为多个 Seurat 对象（按 samples 字段）
+samples_list <- unique(seurat_obj_gse200997@meta.data$samples)
+gse200997_split <- list()
+for (s in samples_list) {
+  cells <- rownames(seurat_obj_gse200997@meta.data)[seurat_obj_gse200997@meta.data$samples == s]
+  if (length(cells) > 0) {
+    obj <- subset(seurat_obj_gse200997, cells = cells)
+    obj@project.name <- s # 用 biological sample 名做 project.name
+    gse200997_split[[s]] <- obj
+  }
+}
+
+# 把拆分出来的每个 biological sample 加入 scRNAlist
+scRNAlist_all <- c(scRNAlist, gse200997_split)
+
+# 检查每个样本的细胞数
+print(sapply(scRNAlist_all, ncol))
+print(names(scRNAlist_all)) 
+
 ```
 
 ## 2. 设置物种特定参数
@@ -296,7 +293,7 @@ cat("========================\n")
 
 ```{r 质控}
 print("开始计算质控指标...")
-
+scRNAlist <- scRNAlist_all
 # 质控统计表 - 初始化用于存储所有样本质控指标的数据框
 qc_summary <- data.frame(
   Sample = 1:length(scRNAlist),                                 # 样本编号
@@ -756,8 +753,8 @@ print(levels(scRNAlist_merge@meta.data$orig.ident))
 
 ```{r}
 # 保存RDS文件
-saveRDS(scRNAlist_merge, file = "gfp_09m28d.rds")
-print("数据已保存为: gfp_07m15d.rds")
+saveRDS(scRNAlist_merge, file = "/home/lin/CRC/CRC_scRNA.rds")
+print("数据已保存为: CRC_scRNA.rds")
 ```
 
 ## 10. 转换为h5ad格式
@@ -869,4 +866,3 @@ ggsave("cell_count_changes.pdf", cell_count_plot, width = 8, height = 6)
 ggsave("retention_rate_changes.pdf", retention_plot, width = 8, height = 6)
 print("处理流程图已保存")
 ```
-
