@@ -10,6 +10,8 @@ library(showtext)
 library(showtext)
 library(sysfonts)
 
+rm(list = ls())
+
 # 加载合并的数据集
 pbmc <- readRDS("/home/lin/c_group/ident.rds")
 levels(pbmc@reductions$umap)

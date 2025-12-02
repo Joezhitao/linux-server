@@ -1,5 +1,5 @@
 # ======================================================
-# C_group_拟时许分析(monocle2)
+# 拟时许分析(monocle2)
 # 作者: Joe
 # 日期: 2025-11-23
 # ======================================================
@@ -8,7 +8,7 @@
 rm(list = ls())
 
 # 设置工作目录
-setwd("/home/lin/c_group/monocle/")
+setwd("/home/lin/GGRM_hep/result//")
 
 # 加载必要的包
 library(monocle)
@@ -22,7 +22,7 @@ library(showtext)
 library(igraph)
 library(readxl)
 # 加载数据
-seu_obj <- readRDS("/home/lin/c_group/HSCs_ident.rds")
+seu_obj <- readRDS("/home/lin/GGRM_hep/result/GGRM_Ep_11m27d.rds")
 
 # 转换Seurat对象为CellDataSet
 sample_ann <- seu_obj@meta.data
@@ -64,19 +64,20 @@ cds <- setOrderingFilter(cds, expressed_genes)
 cds <- reduceDimension(cds, max_components = 2, method = 'DDRTree')
 cds <- orderCells(cds)
 
+#saveRDS(cds,"/home/lin/GGRM_hep/result/GGRM_Ep_monocel.rds")
+
 # 绘制轨迹图
-p1 <- plot_cell_trajectory(cds, color_by = "seurat_clusters")
+p1 <- plot_cell_trajectory(cds, color_by = "group")
 p2 <- plot_cell_trajectory(cds, color_by = "Pseudotime")
 p3 <- plot_cell_trajectory(cds, color_by = "orig.ident")
 p4 <- plot_cell_trajectory(cds, markers = c("Foxp3"), use_color_gradient = TRUE)
-plot_cell_trajectory(cds, color_by = "TREM2_EFFEROCYTOSIS_score1")
 # 组合图像
 combined_plot <- p1 | p2
 #dev.off()
 # 保存图像
-#pdf("Bcells_pseudotime.pdf", width = 30, height = 6)
+pdf("Bcells_pseudotime.pdf", width = 8, height = 6)
 print(combined_plot)
-#dev.off()
+dev.off()
 
 png("Myeloid_cells_pseudotime.png", width = 18, height = 6, res = 300, units = 'in')
 print(combined_plot)

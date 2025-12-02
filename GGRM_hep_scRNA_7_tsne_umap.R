@@ -73,14 +73,14 @@ create_dim_plot <- function(seurat_obj,
 # 主程序
 main <- function() {
   # 加载数据
-  pbmc <- readRDS("/home/lin/GGRM_hep/result/GGRM_hep_ident_11m27d.rds")
+  pbmc <- readRDS("/home/lin/GGRM_hep/result/GGRM_Ep_11m27d.rds")
   
   # 创建并保存图像
   p <- create_dim_plot(
     seurat_obj = pbmc,
-    group_by = "group",  # 可以改为任何元数据列
+    group_by = "seurat_clusters",  # 可以改为任何元数据列
     reduction = "tsne",            # 可以改为"umap"
-    output_file = "/home/lin/GGRM_hep/result/tsne_group.pdf"
+    output_file = "/home/lin/GGRM_hep/result/Ep_tsne_clusters.pdf"
   )
   
   # 显示图像

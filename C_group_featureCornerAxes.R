@@ -8,7 +8,7 @@ rm(list = ls())
 # 设置工作目录
 setwd("/home/lin/c_group/")
 # 读取之前处理好的单细胞数据
-pbmc <- readRDS("/home/lin/c_group/optimization_results/umap/filtered_all_clusters_threshold0.2.rds")
+pbmc <- readRDS("/home/lin/c_group/ident.rds")
 
 # 读取基因列表
 gene_df <- read_excel("/home/lin/c_group/gene.xlsx")
@@ -42,6 +42,6 @@ for (i in 1:n_groups) {
 }
 featureCornerAxes(object = pbmc, reduction = 'umap',
                   groupFacet = NULL,
-                  features = c("Mki67"),
+                  features = c("Pdcd1"),
                   cornerTextSize = 3,
                   themebg = 'bwCorner')
