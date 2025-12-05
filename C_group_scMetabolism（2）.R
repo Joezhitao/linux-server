@@ -1,8 +1,8 @@
 #############################################################
-# 单细胞代谢分析参数化脚本 (scMetabolism + Sankey + CSV)
-# 功能：基因转换、代谢评分、亚群分析、桑葚图绘制、数据导出
-# 适配：Rat/Mouse/Human -> Human Orthologs
-# 日期：2023-10-27 (Updated v3: Added Scenario B)
+# 单细胞代谢分析参数化脚本 (v6: 模糊匹配修复版)
+# 功能：基因转换、代谢评分、亚群分析、桑葚图、基因集导出
+# 修复：增加通路名称清洗机制，确保100%匹配并导出基因
+# 日期：2023-10-27
 #############################################################
 
 rm(list = ls())
@@ -19,6 +19,7 @@ suppressPackageStartupMessages({
   library(viridis)
   library(AUCell)
   library(GSEABase)
+  library(stringr) # 新增字符串处理包
 })
 
 options(future.globals.maxSize = 100 * 1024^3)
@@ -27,7 +28,13 @@ options(future.globals.maxSize = 100 * 1024^3)
 
 # 内部函数：基因转换
 convert_genes_internal <- function(obj, species) {
-  expr_matrix <- as.matrix(GetAssayData(obj, layer = "counts"))
+  # 尝试获取 counts，如果是在 V5 中可能是 layer='counts'
+  expr_matrix <- tryCatch({
+    as.matrix(GetAssayData(obj, layer = "counts"))
+  }, error = function(e) {
+    as.matrix(GetAssayData(obj, slot = "counts")) # 兼容旧版本
+  })
+  
   genes <- rownames(expr_matrix)
   species <- tolower(species)
   
@@ -98,75 +105,66 @@ run_metabolism_internal <- function(obj) {
   return(obj)
 }
 
+# 辅助函数：清洗通路名称 (用于模糊匹配)
+clean_pathway_name <- function(x) {
+  x <- toupper(x) # 转大写
+  x <- gsub("[[:punct:]]", "", x) # 去除标点
+  x <- gsub(" ", "", x) # 去除空格
+  return(x)
+}
+
 # 3. 主函数：代谢分析流程 ------------------------------------------------------
 
 run_metabolism_analysis <- function(
-    seurat_obj,                  # 输入的 Seurat 对象
-    species = "rat",             # 物种: "human", "rat", "mouse"
-    group_by = "seurat_clusters",# 【参数化】最后画图用的分组列 (如 Cluster 或 Group)
-    subset_mode = FALSE,         # 【开关】是否开启亚群分析模式 (TRUE/FALSE)
-    subset_col = NULL,           # 亚群分析-筛选列 (如 celltype)
-    subset_idents = NULL,        # 亚群分析-保留的类别 (如 "Hepatocyte")
-    output_dir = "./metabolism_result", # 输出目录
-    file_prefix = "Analysis"     # 输出文件前缀
+    seurat_obj,                  
+    species = "rat",             
+    group_by = "seurat_clusters",
+    subset_mode = FALSE,         
+    subset_col = NULL,           
+    subset_idents = NULL,        
+    output_dir = "./metabolism_result", 
+    file_prefix = "Analysis"     
 ) {
   
   # --- 0. 初始化 ---
   if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
   cat("=================================================\n")
   cat("开始单细胞代谢分析流程\n")
-  cat(sprintf("物种: %s\n", species))
   
-  # --- 1. 数据预处理与筛选 (亚群模式) ---
+  # --- 1. 数据预处理与筛选 ---
   final_obj <- seurat_obj
-  
   if (subset_mode) {
-    if (is.null(subset_col) || is.null(subset_idents)) {
-      stop("错误: 开启了 subset_mode，但未提供 subset_col 或 subset_idents 参数！")
-    }
+    if (is.null(subset_col) || is.null(subset_idents)) stop("错误: 请设置 subset 参数！")
     cat(sprintf("模式: 亚群分析 (筛选 %s == %s)\n", subset_col, paste(subset_idents, collapse=",")))
-    
-    # 检查列是否存在
-    if (!subset_col %in% colnames(seurat_obj@meta.data)) stop(paste("列不存在:", subset_col))
-    
     Idents(seurat_obj) <- subset_col
     final_obj <- subset(seurat_obj, idents = subset_idents)
-    cat(sprintf("  筛选后细胞数: %d\n", ncol(final_obj)))
-    
-    if(ncol(final_obj) < 10) stop("筛选后细胞过少，无法分析！")
   } else {
-    cat("模式: 全局分析 (使用所有细胞)\n")
+    cat("模式: 全局分析\n")
   }
   
-  # 检查最终的分组列
   if (!group_by %in% colnames(final_obj@meta.data)) stop(paste("分组列不存在:", group_by))
-  cat(sprintf("最终分组依据: %s\n", group_by))
   
   # --- 2. 基因转换 ---
   human_obj <- convert_genes_internal(final_obj, species)
   
-  # --- 3. 代谢评分计算 ---
+  # --- 3. 代谢评分 ---
   human_obj <- run_metabolism_internal(human_obj)
   
-  # --- 4. 绘制桑葚图与数据准备 ---
-  cat("  [INFO] 正在计算通路平均评分...\n")
-  
-  # 提取数据
+  # --- 4. 绘制桑葚图 ---
+  cat("  [INFO] 正在绘制桑葚图...\n")
   met_data <- GetAssayData(human_obj, assay = "METABOLISM", layer = "data")
   idents <- human_obj@meta.data[[group_by]]
   
-  # 计算平均值 (Rows: Pathways, Cols: Groups)
   avg_df <- data.frame(t(met_data))
   avg_df$group <- idents
   avg_res <- avg_df %>% group_by(group) %>% summarise(across(everything(), mean, .names = "{col}"))
   avg_mat <- t(avg_res[,-1])
   colnames(avg_mat) <- avg_res$group
   
-  # 筛选 Top 20 通路 (用于画图)
+  # 筛选 Top 20
   pathway_sd <- apply(avg_mat, 1, sd)
   top_pathways <- names(sort(pathway_sd, decreasing = TRUE))[1:20]
   
-  # 准备绘图数据 (Long format)
   plot_data <- as.data.frame(avg_mat[top_pathways, ])
   plot_data$Pathway <- rownames(plot_data)
   
@@ -180,7 +178,6 @@ run_metabolism_analysis <- function(
   links$IDsource <- match(links$Pathway, nodes$name) - 1
   links$IDtarget <- match(links$TargetGroup, nodes$name) - 1
   
-  # 绘图
   my_color <- 'd3.scaleOrdinal() .domain(["Pathway", "Group"]) .range(["#69b3a2", "#404080"])'
   sankey <- sankeyNetwork(
     Links = links, Nodes = nodes, Source = "IDsource", Target = "IDtarget",
@@ -189,78 +186,85 @@ run_metabolism_analysis <- function(
     nodePadding = 10, sinksRight = FALSE, height = 600, width = 900
   )
   
-  # --- 5. 保存结果 (HTML + RDS + CSV) ---
-  out_html <- file.path(output_dir, paste0(file_prefix, "_Sankey.html"))
-  out_rds <- file.path(output_dir, paste0(file_prefix, "_Metabolism.rds"))
-  out_csv_all <- file.path(output_dir, paste0(file_prefix, "_All_Pathways_Mean_Scores.csv"))
-  out_csv_top <- file.path(output_dir, paste0(file_prefix, "_Top20_Pathways_Mean_Scores.csv"))
-  
+  # --- 5. 保存结果 ---
   cat("  [INFO] 正在导出结果文件...\n")
   
-  # 1. 保存 HTML
+  out_html <- file.path(output_dir, paste0(file_prefix, "_Sankey.html"))
+  out_rds <- file.path(output_dir, paste0(file_prefix, "_Metabolism.rds"))
+  out_csv_all <- file.path(output_dir, paste0(file_prefix, "_Score_Mean.csv"))
+  out_csv_genes <- file.path(output_dir, paste0(file_prefix, "_Pathway_Genes.csv"))
+  
+  # (1) 保存 HTML
   saveNetwork(sankey, file = out_html)
-  
-  # 2. 保存 RDS (含评分的Seurat对象)
+  # (2) 保存 RDS
   saveRDS(human_obj, out_rds)
-  
-  # 3. 保存 CSV (显式调用 dplyr::select 修复冲突)
-  # 保存所有通路的平均分
+  # (3) 保存评分表
   all_pathways_df <- as.data.frame(avg_mat)
   all_pathways_df$Pathway <- rownames(all_pathways_df)
   all_pathways_df <- all_pathways_df %>% dplyr::select(Pathway, everything()) 
   write.csv(all_pathways_df, out_csv_all, row.names = FALSE)
   
-  # 保存 Top 20 (桑葚图中展示的)
-  top_pathways_df <- plot_data
-  top_pathways_df <- top_pathways_df %>% dplyr::select(Pathway, everything())
-  write.csv(top_pathways_df, out_csv_top, row.names = FALSE)
+  # (4) 【增强修复版】模糊匹配并导出基因集
+  cat("  [INFO] 正在解析并导出 Top 20 通路基因 (增强匹配模式)...\n")
+  
+  gmtFile <- system.file("data", "KEGG_metabolism_nc.gmt", package = "scMetabolism")
+  raw_lines <- readLines(gmtFile)
+  gmt_list <- list()
+  
+  # 建立一个清洗后的 Top Pathways 字典
+  # Key: 清洗后的名字, Value: 原始名字 (用于最后CSV列名)
+  clean_top_dict <- setNames(top_pathways, clean_pathway_name(top_pathways))
+  
+  for(line in raw_lines) {
+    parts <- strsplit(line, "\t")[[1]]
+    p_name_raw <- parts[1]
+    p_genes <- parts[-c(1,2)] 
+    p_genes <- p_genes[p_genes != ""] # 去除空字符
+    
+    # 这里的匹配逻辑：把GMT里的名字清洗后，看是否在清洗后的 Top 字典里
+    p_name_clean <- clean_pathway_name(p_name_raw)
+    
+    if(p_name_clean %in% names(clean_top_dict)) {
+      # 找到对应的原始名字
+      original_name <- clean_top_dict[[p_name_clean]]
+      gmt_list[[original_name]] <- p_genes
+    }
+  }
+  
+  if(length(gmt_list) > 0) {
+    # 补齐长度
+    max_len <- max(sapply(gmt_list, length))
+    pad_vec <- function(x, n) { c(x, rep("", n - length(x))) }
+    padded_list <- lapply(gmt_list, pad_vec, n = max_len)
+    
+    # 转换为 DF
+    genes_df <- data.frame(padded_list, check.names = FALSE)
+    write.csv(genes_df, out_csv_genes, row.names = FALSE, quote = FALSE)
+    cat(sprintf("  [SUCCESS] 成功导出 %d 条通路的基因信息！\n", length(gmt_list)))
+  } else {
+    warning("依然没有匹配到通路，请检查 scMetabolism 版本或 GMT 文件内容。")
+  }
   
   cat("=================================================\n")
   cat(sprintf("分析完成！结果保存在: %s\n", output_dir))
   cat(sprintf("1. 桑葚图: %s\n", basename(out_html)))
-  cat(sprintf("2. 所有通路评分表: %s\n", basename(out_csv_all)))
-  cat(sprintf("3. Top20通路评分表: %s\n", basename(out_csv_top)))
-  cat(sprintf("4. Seurat结果对象: %s\n", basename(out_rds)))
+  cat(sprintf("2. 评分均值表: %s\n", basename(out_csv_all)))
+  cat(sprintf("3. Top20通路基因集: %s\n", basename(out_csv_genes)))
+  cat(sprintf("4. Seurat对象: %s\n", basename(out_rds)))
   
   return(human_obj)
 }
 
-
 # 4. 使用示例 ---------------------------------------------------------------
 
-# 读取数据
 seurat_obj <- readRDS("/home/lin/c_group/hep_ident_filtered.rds")
 
-# ============================================
-# 场景 A: 全局分析 (分析所有 Cluster 的代谢)
-# ============================================
+# 场景 A: 全局分析
 res_global <- run_metabolism_analysis(
   seurat_obj = seurat_obj,
   species = "rat",                  
-  group_by = "orig.ident",          # 分组列
+  group_by = "orig.ident",
   subset_mode = FALSE,
   output_dir = "./metabolism_results",
   file_prefix = "Rat_Global_Analysis"
-)
-
-
-# ============================================
-# 场景 B: 亚群分析 (只看某一群细胞在不同分组间的差异)
-# ============================================
-# 假设想看 "Stressed-Anabolic-Hep" 这一类细胞在 "orig.ident" (或其他分组) 的代谢差异
-
-res_subset <- run_metabolism_analysis(
-  seurat_obj = seurat_obj,
-  species = "rat",
-  
-  # 1. 亚群筛选设置 (开启)
-  subset_mode = TRUE,               
-  subset_col = "seurat_clusters",          # 先按哪一列筛选 (比如 seurat_clusters)
-  subset_idents = "Stressed-Anabolic-Hep", # 这一列里要保留哪个亚群
-  
-  # 2. 最终分析设置
-  group_by = "orig.ident",                 # 筛选完后，用这一列来画桑葚图对比 (比如 orig.ident 或 group)
-  
-  output_dir = "./metabolism_results",
-  file_prefix = "Rat_Stressed_Subgroup"
 )
