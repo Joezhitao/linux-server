@@ -1,7 +1,7 @@
 #############################################################
-# 单细胞代谢分析参数化脚本 (v6: 模糊匹配修复版)
+# 单细胞代谢分析参数化脚本 (v7: TopN参数化版)
 # 功能：基因转换、代谢评分、亚群分析、桑葚图、基因集导出
-# 修复：增加通路名称清洗机制，确保100%匹配并导出基因
+# 更新：增加 top_n 参数，可自定义展示通路的数量，若超过总数则自动调整
 # 日期：2023-10-27
 #############################################################
 
@@ -19,7 +19,7 @@ suppressPackageStartupMessages({
   library(viridis)
   library(AUCell)
   library(GSEABase)
-  library(stringr) # 新增字符串处理包
+  library(stringr)
 })
 
 options(future.globals.maxSize = 100 * 1024^3)
@@ -28,11 +28,10 @@ options(future.globals.maxSize = 100 * 1024^3)
 
 # 内部函数：基因转换
 convert_genes_internal <- function(obj, species) {
-  # 尝试获取 counts，如果是在 V5 中可能是 layer='counts'
   expr_matrix <- tryCatch({
     as.matrix(GetAssayData(obj, layer = "counts"))
   }, error = function(e) {
-    as.matrix(GetAssayData(obj, slot = "counts")) # 兼容旧版本
+    as.matrix(GetAssayData(obj, slot = "counts")) 
   })
   
   genes <- rownames(expr_matrix)
@@ -60,7 +59,6 @@ convert_genes_internal <- function(obj, species) {
     human_mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl", host = host_url)
   }, error = function(e) { stop("Ensembl 连接失败，请检查网络或更换 Host") })
   
-  # 分批转换
   batch_size <- 1000
   batches <- split(genes, ceiling(seq_along(genes) / batch_size))
   gene_map_list <- list()
@@ -105,11 +103,11 @@ run_metabolism_internal <- function(obj) {
   return(obj)
 }
 
-# 辅助函数：清洗通路名称 (用于模糊匹配)
+# 辅助函数：清洗通路名称
 clean_pathway_name <- function(x) {
-  x <- toupper(x) # 转大写
-  x <- gsub("[[:punct:]]", "", x) # 去除标点
-  x <- gsub(" ", "", x) # 去除空格
+  x <- toupper(x) 
+  x <- gsub("[[:punct:]]", "", x) 
+  x <- gsub(" ", "", x) 
   return(x)
 }
 
@@ -123,7 +121,8 @@ run_metabolism_analysis <- function(
     subset_col = NULL,           
     subset_idents = NULL,        
     output_dir = "./metabolism_result", 
-    file_prefix = "Analysis"     
+    file_prefix = "Analysis",
+    top_n = 20  # <--- 新增参数：默认为20
 ) {
   
   # --- 0. 初始化 ---
@@ -151,7 +150,7 @@ run_metabolism_analysis <- function(
   human_obj <- run_metabolism_internal(human_obj)
   
   # --- 4. 绘制桑葚图 ---
-  cat("  [INFO] 正在绘制桑葚图...\n")
+  cat("  [INFO] 正在计算通路差异并绘制桑葚图...\n")
   met_data <- GetAssayData(human_obj, assay = "METABOLISM", layer = "data")
   idents <- human_obj@meta.data[[group_by]]
   
@@ -161,11 +160,18 @@ run_metabolism_analysis <- function(
   avg_mat <- t(avg_res[,-1])
   colnames(avg_mat) <- avg_res$group
   
-  # 筛选 Top 20
+  # --- 核心修改：筛选 Top N 通路逻辑 ---
   pathway_sd <- apply(avg_mat, 1, sd)
-  top_pathways <- names(sort(pathway_sd, decreasing = TRUE))[1:20]
   
-  plot_data <- as.data.frame(avg_mat[top_pathways, ])
+  # 计算实际可用的通路数量
+  total_available <- length(pathway_sd)
+  real_top_n <- min(top_n, total_available) # 取较小值，防止越界
+  
+  cat(sprintf("  [INFO] 请求 Top %d，实际可用 %d，将展示 Top %d 通路...\n", top_n, total_available, real_top_n))
+  
+  top_pathways <- names(sort(pathway_sd, decreasing = TRUE))[1:real_top_n]
+  
+  plot_data <- as.data.frame(avg_mat[top_pathways, , drop = FALSE])
   plot_data$Pathway <- rownames(plot_data)
   
   links <- plot_data %>%
@@ -179,65 +185,60 @@ run_metabolism_analysis <- function(
   links$IDtarget <- match(links$TargetGroup, nodes$name) - 1
   
   my_color <- 'd3.scaleOrdinal() .domain(["Pathway", "Group"]) .range(["#69b3a2", "#404080"])'
+  
+  # 动态调整高度，如果通路很多，增加图片高度
+  plot_height <- max(600, real_top_n * 25) 
+  
   sankey <- sankeyNetwork(
     Links = links, Nodes = nodes, Source = "IDsource", Target = "IDtarget",
     Value = "Value", NodeID = "name", NodeGroup = "group", LinkGroup = "Pathway",
     colourScale = my_color, units = "Score", fontSize = 14, nodeWidth = 30,
-    nodePadding = 10, sinksRight = FALSE, height = 600, width = 900
+    nodePadding = 10, sinksRight = FALSE, height = plot_height, width = 900
   )
   
   # --- 5. 保存结果 ---
   cat("  [INFO] 正在导出结果文件...\n")
   
-  out_html <- file.path(output_dir, paste0(file_prefix, "_Sankey.html"))
+  out_html <- file.path(output_dir, paste0(file_prefix, "_Sankey_Top", real_top_n, ".html"))
   out_rds <- file.path(output_dir, paste0(file_prefix, "_Metabolism.rds"))
   out_csv_all <- file.path(output_dir, paste0(file_prefix, "_Score_Mean.csv"))
-  out_csv_genes <- file.path(output_dir, paste0(file_prefix, "_Pathway_Genes.csv"))
+  out_csv_genes <- file.path(output_dir, paste0(file_prefix, "_Pathway_Genes_Top", real_top_n, ".csv"))
   
-  # (1) 保存 HTML
   saveNetwork(sankey, file = out_html)
-  # (2) 保存 RDS
   saveRDS(human_obj, out_rds)
-  # (3) 保存评分表
+  
   all_pathways_df <- as.data.frame(avg_mat)
   all_pathways_df$Pathway <- rownames(all_pathways_df)
   all_pathways_df <- all_pathways_df %>% dplyr::select(Pathway, everything()) 
   write.csv(all_pathways_df, out_csv_all, row.names = FALSE)
   
-  # (4) 【增强修复版】模糊匹配并导出基因集
-  cat("  [INFO] 正在解析并导出 Top 20 通路基因 (增强匹配模式)...\n")
+  # (4) 导出基因集
+  cat(sprintf("  [INFO] 正在解析并导出 Top %d 通路基因...\n", real_top_n))
   
   gmtFile <- system.file("data", "KEGG_metabolism_nc.gmt", package = "scMetabolism")
   raw_lines <- readLines(gmtFile)
   gmt_list <- list()
   
-  # 建立一个清洗后的 Top Pathways 字典
-  # Key: 清洗后的名字, Value: 原始名字 (用于最后CSV列名)
   clean_top_dict <- setNames(top_pathways, clean_pathway_name(top_pathways))
   
   for(line in raw_lines) {
     parts <- strsplit(line, "\t")[[1]]
     p_name_raw <- parts[1]
     p_genes <- parts[-c(1,2)] 
-    p_genes <- p_genes[p_genes != ""] # 去除空字符
+    p_genes <- p_genes[p_genes != ""] 
     
-    # 这里的匹配逻辑：把GMT里的名字清洗后，看是否在清洗后的 Top 字典里
     p_name_clean <- clean_pathway_name(p_name_raw)
     
     if(p_name_clean %in% names(clean_top_dict)) {
-      # 找到对应的原始名字
       original_name <- clean_top_dict[[p_name_clean]]
       gmt_list[[original_name]] <- p_genes
     }
   }
   
   if(length(gmt_list) > 0) {
-    # 补齐长度
     max_len <- max(sapply(gmt_list, length))
     pad_vec <- function(x, n) { c(x, rep("", n - length(x))) }
     padded_list <- lapply(gmt_list, pad_vec, n = max_len)
-    
-    # 转换为 DF
     genes_df <- data.frame(padded_list, check.names = FALSE)
     write.csv(genes_df, out_csv_genes, row.names = FALSE, quote = FALSE)
     cat(sprintf("  [SUCCESS] 成功导出 %d 条通路的基因信息！\n", length(gmt_list)))
@@ -249,7 +250,7 @@ run_metabolism_analysis <- function(
   cat(sprintf("分析完成！结果保存在: %s\n", output_dir))
   cat(sprintf("1. 桑葚图: %s\n", basename(out_html)))
   cat(sprintf("2. 评分均值表: %s\n", basename(out_csv_all)))
-  cat(sprintf("3. Top20通路基因集: %s\n", basename(out_csv_genes)))
+  cat(sprintf("3. Top%d通路基因集: %s\n", real_top_n, basename(out_csv_genes)))
   cat(sprintf("4. Seurat对象: %s\n", basename(out_rds)))
   
   return(human_obj)
@@ -257,26 +258,34 @@ run_metabolism_analysis <- function(
 
 # 4. 使用示例 ---------------------------------------------------------------
 
-seurat_obj <- readRDS("/home/lin/c_group/hep_ident_filtered.rds")
-
-# 场景 A: 全局分析
+# 请确保这里读取的是您的 Seurat 对象路径
+seurat_obj <- readRDS("/home/lin/c_group/hep.rds")
+levels(seurat_obj@meta.data$cellcluster)
+# ==============================================
+# 场景 A: 全局分析 (自定义 Top 30)
+# ==============================================
+# 如果总通路只有 25 条，脚本会自动只展示 25 条
 res_global <- run_metabolism_analysis(
   seurat_obj = seurat_obj,
   species = "rat",                  
-  group_by = "orig.ident",
+  group_by = "cellcluster",
   subset_mode = FALSE,
-  output_dir = "./metabolism_results",
+  top_n = 40,                         # <--- 示例：改为查看前30条
+  output_dir = "/home/lin/c_group/metabolism_results",
   file_prefix = "Rat_Global_Analysis"
 )
 
-# 场景 B: 亚群分析
+# ==============================================
+# 场景 B: 亚群分析 (使用默认 Top 20)
+# ==============================================
 res_subset <- run_metabolism_analysis(
   seurat_obj = seurat_obj,
   species = "rat",
   subset_mode = TRUE,               
-  subset_col = "seurat_clusters",   
-  subset_idents = "Stressed-Anabolic-Hep", 
-  group_by = "orig.ident",                
-  output_dir = "./metabolism_results",
-  file_prefix = "Rat_Stressed_Subgroup"
+  subset_col = "cellcluster",   
+  subset_idents = "Regenerative-Unit-Hep", 
+  group_by = "orig.ident",
+  top_n = 20,                         # <--- 示例：显式设置为20（或不写该行，默认即为20）
+  output_dir = "/home/lin/c_group/metabolism_results/stress",
+  file_prefix = "Rat_Regenerative_Subgroup"
 )
